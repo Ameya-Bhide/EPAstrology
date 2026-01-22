@@ -54,7 +54,30 @@ def ingest_rosters(seasons: List[int], save_path: Optional[Path] = None) -> pd.D
     """
     logger.info(f"Ingesting roster data for seasons {seasons}")
     
-    rosters = nfl.import_rosters(years=seasons)
+    # Try different function name variations
+    if hasattr(nfl, 'import_rosters'):
+        rosters = nfl.import_rosters(years=seasons)
+    elif hasattr(nfl, 'import_roster'):
+        rosters = nfl.import_roster(years=seasons)
+    elif hasattr(nfl, 'load_rosters'):
+        rosters = nfl.load_rosters(years=seasons)
+    elif hasattr(nfl, 'import_players'):
+        # Try different parameter names
+        try:
+            rosters = nfl.import_players(years=seasons)
+        except TypeError:
+            try:
+                rosters = nfl.import_players(seasons=seasons)
+            except TypeError:
+                rosters = nfl.import_players()
+                # Filter to requested seasons if possible
+                if 'season' in rosters.columns:
+                    rosters = rosters[rosters['season'].isin(seasons)]
+    else:
+        raise AttributeError(
+            "Could not find roster import function. Available functions: " +
+            str([x for x in dir(nfl) if not x.startswith('_')])
+        )
     
     if save_path:
         save_path = Path(save_path)
@@ -78,7 +101,40 @@ def ingest_schedules(seasons: List[int], save_path: Optional[Path] = None) -> pd
     """
     logger.info(f"Ingesting schedule data for seasons {seasons}")
     
-    schedules = nfl.import_schedules(years=seasons)
+    # Try different function name variations
+    if hasattr(nfl, 'import_schedules'):
+        schedules = nfl.import_schedules(years=seasons)
+    elif hasattr(nfl, 'import_schedule'):
+        schedules = nfl.import_schedule(years=seasons)
+    elif hasattr(nfl, 'load_schedules'):
+        schedules = nfl.load_schedules(years=seasons)
+    else:
+        # Extract schedule from pbp data (fallback)
+        logger.info("Extracting schedule from pbp data")
+        pbp = nfl.import_pbp_data(years=seasons, downcast=True)
+        # Extract unique games from pbp
+        schedule_cols = []
+        for col in ['game_id', 'old_game_id', 'game_date', 'gameday', 'home_team', 'away_team', 'season', 'week', 'posteam', 'defteam']:
+            if col in pbp.columns:
+                schedule_cols.append(col)
+        
+        if 'game_id' in pbp.columns:
+            # Get unique games
+            schedules = pbp[schedule_cols].drop_duplicates(subset=['game_id'])
+            # Ensure we have required columns
+            if 'gameday' not in schedules.columns and 'game_date' in schedules.columns:
+                schedules = schedules.rename(columns={'game_date': 'gameday'})
+            elif 'gameday' not in schedules.columns:
+                # Try to construct from other columns
+                if 'season' in schedules.columns and 'week' in schedules.columns:
+                    schedules['gameday'] = pd.to_datetime(schedules['season'].astype(str) + '-09-01')
+                else:
+                    raise ValueError("Cannot extract game dates from pbp data")
+        else:
+            raise AttributeError(
+                "Could not find schedule import function and cannot extract from pbp. Available functions: " +
+                str([x for x in dir(nfl) if not x.startswith('_')])
+            )
     
     if save_path:
         save_path = Path(save_path)

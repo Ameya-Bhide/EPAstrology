@@ -55,17 +55,61 @@ def build_players_table(
     """
     logger.info("Building players table")
     
+    # Map column names from nfl_data_py to our expected names
+    # nfl_data_py uses: gsis_id (or player_id), display_name, position, season
+    column_mapping = {}
+    
+    # Find player ID column
+    if "player_id" in rosters.columns:
+        player_id_col = "player_id"
+    elif "gsis_id" in rosters.columns:
+        player_id_col = "gsis_id"
+    else:
+        raise ValueError(f"Could not find player ID column. Available columns: {list(rosters.columns)}")
+    
+    # Find name column
+    if "player_name" in rosters.columns:
+        name_col = "player_name"
+    elif "display_name" in rosters.columns:
+        name_col = "display_name"
+    elif "name" in rosters.columns:
+        name_col = "name"
+    else:
+        raise ValueError(f"Could not find name column. Available columns: {list(rosters.columns)}")
+    
+    # Find position column
+    if "position" not in rosters.columns:
+        raise ValueError(f"Could not find position column. Available columns: {list(rosters.columns)}")
+    
+    # Find season column (optional)
+    season_col = "season" if "season" in rosters.columns else None
+    
+    # Create a working copy with standardized column names
+    rosters_work = rosters.copy()
+    rosters_work["_player_id"] = rosters_work[player_id_col]
+    rosters_work["_name"] = rosters_work[name_col]
+    rosters_work["_position"] = rosters_work["position"]
+    
+    if season_col:
+        rosters_work["_season"] = rosters_work[season_col]
+    else:
+        # If no season column, assume all are from the same season
+        rosters_work["_season"] = rosters_work.get("season", 2023)
+    
     # Get unique players with their most recent position
-    players = rosters.groupby("player_id").agg({
-        "player_name": "first",  # Use first name (should be consistent)
-        "position": "last",  # Use most recent position
-        "season": "max"  # Track most recent season
-    }).reset_index()
+    agg_dict = {
+        "_name": "first",
+        "_position": "last",
+    }
+    if season_col:
+        agg_dict["_season"] = "max"
+    
+    players = rosters_work.groupby("_player_id").agg(agg_dict).reset_index()
     
     players = players.rename(columns={
-        "player_id": "player_id",
-        "player_name": "name",
-        "position": "position"
+        "_player_id": "player_id",
+        "_name": "name",
+        "_position": "position"
     })
     
     # Select only relevant columns
@@ -110,50 +154,106 @@ def build_player_game_offense_table(
     # We'll use the team from the play itself for now
     player_stats = []
     
+    # Find the correct column names for player IDs
+    # nfl_data_py may use different column names
+    target_id_col = None
+    rusher_id_col = None
+    
+    for col in ["target_player_id", "receiver_player_id", "receiver_id", "target_id"]:
+        if col in offense_plays.columns:
+            target_id_col = col
+            break
+    
+    for col in ["rusher_player_id", "rusher_id", "carrier_id"]:
+        if col in offense_plays.columns:
+            rusher_id_col = col
+            break
+    
+    if target_id_col is None:
+        logger.warning("Could not find target player ID column. Available columns: " + 
+                      str([c for c in offense_plays.columns if 'target' in c.lower() or 'receiver' in c.lower()]))
+        # Try to use receiver from names if available
+        if "receiver_player_name" in offense_plays.columns:
+            logger.info("Using receiver_player_name to identify targets")
+            target_id_col = "receiver_player_name"
+        else:
+            raise ValueError("Could not find target/receiver player identifier in pbp data")
+    
+    if rusher_id_col is None:
+        logger.warning("Could not find rusher player ID column. Available columns: " + 
+                      str([c for c in offense_plays.columns if 'rush' in c.lower() or 'carrier' in c.lower()]))
+        # Try to use rusher from names if available
+        if "rusher_player_name" in offense_plays.columns:
+            logger.info("Using rusher_player_name to identify rushers")
+            rusher_id_col = "rusher_player_name"
+        else:
+            raise ValueError("Could not find rusher/carrier player identifier in pbp data")
+    
     # Passing stats (targets, receptions, receiving yards, EPA)
     pass_plays = offense_plays[offense_plays["play_type"] == "pass"].copy()
     
-    # Targets
-    targets = pass_plays[pass_plays["target_player_id"].notna()].groupby(
-        ["game_id", "target_player_id", "posteam"]
-    ).agg({
-        "epa": "sum",
-        "complete_pass": "sum",
-        "yards_gained": "sum",
-        "success": "sum",
-        "play_id": "count"  # Count as targets
-    }).reset_index()
+    # Targets - filter to plays with a target
+    if target_id_col in pass_plays.columns:
+        pass_plays_with_target = pass_plays[pass_plays[target_id_col].notna()].copy()
+    else:
+        pass_plays_with_target = pass_plays.copy()
     
-    targets = targets.rename(columns={
-        "target_player_id": "player_id",
-        "posteam": "team",
-        "play_id": "targets",
-        "complete_pass": "receptions",
-        "yards_gained": "receiving_yards",
-        "epa": "epa_receiving",
-        "success": "success_receiving"
-    })
+    if len(pass_plays_with_target) > 0:
+        targets = pass_plays_with_target.groupby(
+            ["game_id", target_id_col, "posteam"]
+        ).agg({
+            "epa": "sum",
+            "complete_pass": "sum",
+            "yards_gained": "sum",
+            "success": "sum",
+            "play_id": "count"  # Count as targets
+        }).reset_index()
+        
+        targets = targets.rename(columns={
+            target_id_col: "player_id",
+            "posteam": "team",
+            "play_id": "targets",
+            "complete_pass": "receptions",
+            "yards_gained": "receiving_yards",
+            "epa": "epa_receiving",
+            "success": "success_receiving"
+        })
+    else:
+        # Create empty dataframe with correct structure
+        targets = pd.DataFrame(columns=["game_id", "player_id", "team", "targets", 
+                                        "receptions", "receiving_yards", "epa_receiving", "success_receiving"])
     
     # Rushing stats (carries, rushing yards, EPA)
     rush_plays = offense_plays[offense_plays["play_type"] == "run"].copy()
     
-    carries = rush_plays[rush_plays["rusher_player_id"].notna()].groupby(
-        ["game_id", "rusher_player_id", "posteam"]
-    ).agg({
-        "epa": "sum",
-        "yards_gained": "sum",
-        "success": "sum",
-        "play_id": "count"  # Count as carries
-    }).reset_index()
+    # Carries - filter to plays with a rusher
+    if rusher_id_col in rush_plays.columns:
+        rush_plays_with_rusher = rush_plays[rush_plays[rusher_id_col].notna()].copy()
+    else:
+        rush_plays_with_rusher = rush_plays.copy()
     
-    carries = carries.rename(columns={
-        "rusher_player_id": "player_id",
-        "posteam": "team",
-        "play_id": "carries",
-        "yards_gained": "rushing_yards",
-        "epa": "epa_rushing",
-        "success": "success_rushing"
-    })
+    if len(rush_plays_with_rusher) > 0:
+        carries = rush_plays_with_rusher.groupby(
+            ["game_id", rusher_id_col, "posteam"]
+        ).agg({
+            "epa": "sum",
+            "yards_gained": "sum",
+            "success": "sum",
+            "play_id": "count"  # Count as carries
+        }).reset_index()
+        
+        carries = carries.rename(columns={
+            rusher_id_col: "player_id",
+            "posteam": "team",
+            "play_id": "carries",
+            "yards_gained": "rushing_yards",
+            "epa": "epa_rushing",
+            "success": "success_rushing"
+        })
+    else:
+        # Create empty dataframe with correct structure
+        carries = pd.DataFrame(columns=["game_id", "player_id", "team", "carries",
+                                       "rushing_yards", "epa_rushing", "success_rushing"])
     
     # Merge targets and carries
     player_game = pd.merge(
@@ -188,24 +288,38 @@ def build_player_game_offense_table(
     
     # Success rate (successful plays / total plays)
     total_plays = player_game["targets"] + player_game["carries"]
-    total_success = player_game.get("success_receiving", 0) + player_game.get("success_rushing", 0)
-    player_game["success_rate"] = (
-        total_success / total_plays if total_plays > 0 else 0.0
+    total_success = player_game.get("success_receiving", pd.Series([0] * len(player_game))) + player_game.get("success_rushing", pd.Series([0] * len(player_game)))
+    player_game["success_rate"] = player_game.apply(
+        lambda x: (x.get("success_receiving", 0) + x.get("success_rushing", 0)) / (x["targets"] + x["carries"]) 
+        if (x["targets"] + x["carries"]) > 0 else 0.0,
+        axis=1
     )
     
     # Redzone touches (targets + carries in redzone)
     # Get redzone plays (inside 20 yard line)
-    redzone_passes = pass_plays[
-        (pass_plays["target_player_id"].notna()) &
-        (pass_plays["yardline_100"] <= 20)
-    ].groupby(["game_id", "target_player_id", "posteam"]).size().reset_index(name="rz_targets")
-    redzone_passes = redzone_passes.rename(columns={"target_player_id": "player_id", "posteam": "team"})
+    if "yardline_100" in pass_plays.columns:
+        redzone_pass_filter = (
+            (pass_plays[target_id_col].notna()) &
+            (pass_plays["yardline_100"] <= 20)
+        )
+        redzone_passes = pass_plays[redzone_pass_filter].groupby(
+            ["game_id", target_id_col, "posteam"]
+        ).size().reset_index(name="rz_targets")
+        redzone_passes = redzone_passes.rename(columns={target_id_col: "player_id", "posteam": "team"})
+    else:
+        redzone_passes = pd.DataFrame(columns=["game_id", "player_id", "team", "rz_targets"])
     
-    redzone_rushes = rush_plays[
-        (rush_plays["rusher_player_id"].notna()) &
-        (rush_plays["yardline_100"] <= 20)
-    ].groupby(["game_id", "rusher_player_id", "posteam"]).size().reset_index(name="rz_carries")
-    redzone_rushes = redzone_rushes.rename(columns={"rusher_player_id": "player_id", "posteam": "team"})
+    if "yardline_100" in rush_plays.columns:
+        redzone_rush_filter = (
+            (rush_plays[rusher_id_col].notna()) &
+            (rush_plays["yardline_100"] <= 20)
+        )
+        redzone_rushes = rush_plays[redzone_rush_filter].groupby(
+            ["game_id", rusher_id_col, "posteam"]
+        ).size().reset_index(name="rz_carries")
+        redzone_rushes = redzone_rushes.rename(columns={rusher_id_col: "player_id", "posteam": "team"})
+    else:
+        redzone_rushes = pd.DataFrame(columns=["game_id", "player_id", "team", "rz_carries"])
     
     rz_touches = pd.merge(
         redzone_passes,
@@ -296,15 +410,15 @@ def build_team_game_offense_table(
     team_stats["rushes"] = team_stats["team_plays"] - team_stats["dropbacks"]
     
     # Pass rate
-    team_stats["pass_rate"] = (
-        team_stats["dropbacks"] / team_stats["team_plays"]
-        if team_stats["team_plays"] > 0 else 0.0
+    team_stats["pass_rate"] = team_stats.apply(
+        lambda x: x["dropbacks"] / x["team_plays"] if x["team_plays"] > 0 else 0.0,
+        axis=1
     )
     
     # EPA per play
-    team_stats["team_epa_per_play"] = (
-        team_stats["epa"] / team_stats["team_plays"]
-        if team_stats["team_plays"] > 0 else 0.0
+    team_stats["team_epa_per_play"] = team_stats.apply(
+        lambda x: x["epa"] / x["team_plays"] if x["team_plays"] > 0 else 0.0,
+        axis=1
     )
     
     # Select final columns

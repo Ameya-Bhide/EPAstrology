@@ -111,6 +111,62 @@ def features(
 
 
 @app.command()
+def search_players(
+    query: str = typer.Argument(..., help="Player name to search for (partial match)"),
+    position: Optional[str] = typer.Option(None, "--position", help="Filter by position"),
+    data_dir: Optional[str] = typer.Option(
+        None,
+        "--data-dir",
+        help="Data directory with Parquet files"
+    )
+):
+    """Search for players by name to find correct spelling."""
+    console.print(f"[bold green]Searching for players matching '{query}'...[/bold green]")
+    
+    data_path = Path(data_dir) if data_dir else PARQUET_DIR
+    
+    try:
+        players = pd.read_parquet(data_path / "players.parquet")
+    except FileNotFoundError:
+        console.print("[red]Error:[/red] Players table not found. Run 'build' command first.")
+        raise typer.Exit(1)
+    
+    # Search for players (case-insensitive, partial match)
+    matches = players[
+        players["name"].str.contains(query, case=False, na=False)
+    ]
+    
+    if position:
+        matches = matches[matches["position"] == position]
+    
+    if len(matches) == 0:
+        console.print(f"[yellow]No players found matching '{query}'[/yellow]")
+        raise typer.Exit(0)
+    
+    # Display results in a table
+    table = Table(title=f"Players matching '{query}'")
+    table.add_column("Player ID", style="cyan")
+    table.add_column("Name", style="magenta")
+    table.add_column("Position", style="green")
+    
+    for _, row in matches.head(50).iterrows():  # Limit to 50 results
+        table.add_row(
+            row["player_id"],
+            row["name"],
+            row["position"]
+        )
+    
+    console.print(table)
+    
+    if len(matches) > 50:
+        console.print(f"\n[yellow]Showing first 50 of {len(matches)} results. Use a more specific query to narrow down.[/yellow]")
+    else:
+        console.print(f"\n[green]Found {len(matches)} player(s)[/green]")
+    
+    console.print("\n[bold]Tip:[/bold] Copy the exact name from above to use in the 'report' command")
+
+
+@app.command()
 def report(
     player: str = typer.Argument(..., help="Player name to report on"),
     from_date: str = typer.Option(..., "--from", help="Start date (YYYY-MM-DD)"),
@@ -150,6 +206,8 @@ def report(
     player_matches = players[players["name"].str.contains(player, case=False, na=False)]
     if len(player_matches) == 0:
         console.print(f"[red]Error:[/red] Player '{player}' not found")
+        console.print("\n[yellow]Tip:[/yellow] Use 'nflproj search-players <name>' to find the correct spelling")
+        console.print(f"Example: nflproj search-players {player.split()[0] if ' ' in player else player}")
         raise typer.Exit(1)
     
     if len(player_matches) > 1:
@@ -267,37 +325,62 @@ def project(
     player_matches = players[players["name"].str.contains(player, case=False, na=False)]
     if len(player_matches) == 0:
         console.print(f"[red]Error:[/red] Player '{player}' not found")
+        console.print("\n[yellow]Tip:[/yellow] Use 'nflproj search-players <name>' to find the correct spelling")
+        console.print(f"Example: nflproj search-players {player.split()[0] if ' ' in player else player}")
         raise typer.Exit(1)
     
     player_id = player_matches.iloc[0]["player_id"]
     player_name = player_matches.iloc[0]["name"]
     
-    # Find game
+    # Find game where player actually played
     if date:
         game_date = pd.to_datetime(date)
-        game_matches = games[games["date"] == game_date]
+        # First try to find game where player played on this date
+        player_games_on_date = player_game[
+            (player_game["player_id"] == player_id) &
+            (player_game["game_id"].isin(games[games["date"] == game_date]["game_id"]))
+        ]
+        if len(player_games_on_date) > 0:
+            game_id = player_games_on_date.iloc[0]["game_id"]
+        else:
+            # Fall back to any game on that date
+            game_matches = games[games["date"] == game_date]
+            if len(game_matches) == 0:
+                console.print(f"[red]Error:[/red] No games found on date {date}")
+                raise typer.Exit(1)
+            game_id = game_matches.iloc[0]["game_id"]
+            console.print(f"[yellow]Warning:[/yellow] Player {player_name} not found in games on {date}, using first game")
     elif week and season:
-        game_matches = games[(games["week"] == week) & (games["season"] == season)]
+        # First try to find game where player played in this week
+        week_games = games[(games["week"] == week) & (games["season"] == season)]
+        if len(week_games) == 0:
+            console.print(f"[red]Error:[/red] No games found for week {week}, season {season}")
+            raise typer.Exit(1)
+        
+        player_games_in_week = player_game[
+            (player_game["player_id"] == player_id) &
+            (player_game["game_id"].isin(week_games["game_id"]))
+        ]
+        if len(player_games_in_week) > 0:
+            game_id = player_games_in_week.iloc[0]["game_id"]
+        else:
+            # Player didn't play in week 10 - suggest alternative
+            console.print(f"[red]Error:[/red] Player {player_name} did not play in week {week}, season {season}")
+            # Find what weeks they did play
+            player_all_games = player_game[player_game["player_id"] == player_id]
+            if len(player_all_games) > 0:
+                player_games_with_info = player_all_games.merge(
+                    games[["game_id", "week", "season", "date"]], on="game_id"
+                )
+                player_games_season = player_games_with_info[player_games_with_info["season"] == season]
+                if len(player_games_season) > 0:
+                    weeks_played = sorted(player_games_season["week"].unique())
+                    console.print(f"\n[yellow]Player played in weeks: {', '.join(map(str, weeks_played))}[/yellow]")
+                    console.print(f"Try: nflproj project \"{player_name}\" --week {weeks_played[0]} --season {season}")
+            raise typer.Exit(1)
     else:
         console.print("[red]Error:[/red] Must provide either --date or --week and --season")
         raise typer.Exit(1)
-    
-    if len(game_matches) == 0:
-        console.print("[red]Error:[/red] Game not found")
-        raise typer.Exit(1)
-    
-    # Find game where player is playing
-    player_games = player_game[
-        (player_game["player_id"] == player_id) &
-        (player_game["game_id"].isin(game_matches["game_id"]))
-    ]
-    
-    if len(player_games) == 0:
-        console.print(f"[yellow]Warning:[/yellow] Player {player_name} not found in specified game(s)")
-        # Use first game anyway
-        game_id = game_matches.iloc[0]["game_id"]
-    else:
-        game_id = player_games.iloc[0]["game_id"]
     
     # Initialize models
     role_model = BaselineRoleModel()
@@ -305,6 +388,22 @@ def project(
     
     efficiency_model = BaselineEfficiencyModel()
     efficiency_model.fit(player_game, players)
+    
+    # Check if features exist for this player-game
+    player_features = features[
+        (features["player_id"] == player_id) &
+        (features["game_id"] == game_id)
+    ]
+    
+    if len(player_features) == 0:
+        console.print(f"[red]Error:[/red] No features found for {player_name} in game {game_id}")
+        console.print("\n[yellow]Possible reasons:[/yellow]")
+        console.print("  1. Features not generated - run 'nflproj features' first")
+        console.print("  2. Player didn't play in this game")
+        console.print("  3. Player is a QB or other position not tracked for targets/carries")
+        console.print(f"\n[yellow]Tip:[/yellow] This system tracks offensive skill positions (WR, RB, TE)")
+        console.print("   For QBs, use 'report' to see passing stats instead")
+        raise typer.Exit(1)
     
     # Make projection
     try:
@@ -327,8 +426,20 @@ def project(
         console.print(f"\n[bold]Total:[/bold]")
         console.print(f"  Projected EPA Contribution: {proj['proj_epa_total']:.2f}")
         
+    except KeyError as e:
+        console.print(f"[red]Error:[/red] Missing column: {e}")
+        console.print("\n[yellow]This might indicate:[/yellow]")
+        console.print("  1. Tables need to be rebuilt - run 'nflproj build'")
+        console.print("  2. Data structure mismatch")
+        import traceback
+        console.print(f"\n[dim]Traceback:[/dim]")
+        console.print(traceback.format_exc())
+        raise typer.Exit(1)
     except Exception as e:
         console.print(f"[red]Error:[/red] {e}")
+        import traceback
+        console.print(f"\n[dim]Full error:[/dim]")
+        console.print(traceback.format_exc())
         raise typer.Exit(1)
 
 

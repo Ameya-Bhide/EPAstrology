@@ -68,18 +68,29 @@ def compute_positional_averages(
     
     # Filter to relevant opportunities
     if "target" in metric:
-        merged = merged[merged["targets"] > 0]
-        weights = merged["targets"]
+        merged = merged[merged["targets"] > 0].copy()
+        weight_col = "targets"
     elif "rush" in metric:
-        merged = merged[merged["carries"] > 0]
-        weights = merged["carries"]
+        merged = merged[merged["carries"] > 0].copy()
+        weight_col = "carries"
     else:
-        weights = None
+        weight_col = None
     
-    if weights is not None:
-        pos_avg = merged.groupby("position").apply(
-            lambda x: np.average(x[metric], weights=x[weights])
-        ).to_dict()
+    if weight_col is not None and weight_col in merged.columns:
+        # Compute weighted average by position
+        pos_avg = {}
+        for position, group in merged.groupby("position"):
+            if len(group) > 0 and weight_col in group.columns:
+                weights = group[weight_col].values
+                values = group[metric].values
+                # Filter out any NaN values
+                mask = ~(np.isnan(values) | np.isnan(weights))
+                if mask.sum() > 0:
+                    pos_avg[position] = np.average(values[mask], weights=weights[mask])
+                else:
+                    pos_avg[position] = 0.0
+            else:
+                pos_avg[position] = 0.0
     else:
         pos_avg = merged.groupby("position")[metric].mean().to_dict()
     
@@ -123,6 +134,10 @@ class BaselineRoleModel:
         self.positional_avgs["carry_share"] = player_with_team.groupby("position")["carry_share"].mean().to_dict()
         
         # Team volume averages (dropbacks and rushes per game)
+        if "dropbacks" not in team_game.columns:
+            raise KeyError("'dropbacks' column not found in team_game table")
+        if "rushes" not in team_game.columns:
+            raise KeyError("'rushes' column not found in team_game table. Available columns: " + str(list(team_game.columns)))
         self.team_volume_avgs["dropbacks"] = team_game["dropbacks"].mean()
         self.team_volume_avgs["rushes"] = team_game["rushes"].mean()
     
@@ -183,7 +198,12 @@ class BaselineRoleModel:
                     on="game_id",
                     how="left"
                 )
-                season_with_team = season_games[season_games["targets"] > 0]
+                # Filter to games where player had targets AND team had dropbacks
+                season_with_team = season_with_team[
+                    (season_with_team["targets"] > 0) & 
+                    (season_with_team["dropbacks"].notna()) &
+                    (season_with_team["dropbacks"] > 0)
+                ]
                 
                 if len(season_with_team) > 0 and season_with_team["dropbacks"].sum() > 0:
                     target_share_season = season_with_team["targets"].sum() / season_with_team["dropbacks"].sum()
@@ -262,7 +282,12 @@ class BaselineRoleModel:
                     on="game_id",
                     how="left"
                 )
-                season_with_team = season_games[season_games["carries"] > 0]
+                # Filter to games where player had carries AND team had rushes
+                season_with_team = season_with_team[
+                    (season_with_team["carries"] > 0) & 
+                    (season_with_team["rushes"].notna()) &
+                    (season_with_team["rushes"] > 0)
+                ]
                 
                 if len(season_with_team) > 0 and season_with_team["rushes"].sum() > 0:
                     carry_share_season = season_with_team["carries"].sum() / season_with_team["rushes"].sum()
