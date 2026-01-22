@@ -73,6 +73,12 @@ def compute_positional_averages(
     elif "rush" in metric:
         merged = merged[merged["carries"] > 0].copy()
         weight_col = "carries"
+    elif "attempt" in metric:
+        merged = merged[merged["pass_attempts"] > 0].copy() if "pass_attempts" in merged.columns else pd.DataFrame()
+        weight_col = "pass_attempts"
+    elif "completion" in metric:
+        merged = merged[merged["pass_attempts"] > 0].copy() if "pass_attempts" in merged.columns else pd.DataFrame()
+        weight_col = "pass_attempts"
     else:
         weight_col = None
     
@@ -132,6 +138,19 @@ class BaselineRoleModel:
         player_with_team["carry_share"] = player_with_team["carries"] / player_with_team["rushes"]
         
         self.positional_avgs["carry_share"] = player_with_team.groupby("position")["carry_share"].mean().to_dict()
+        
+        # QB pass attempt share (for QBs, their share of team dropbacks)
+        if "pass_attempts" in merged.columns:
+            qb_with_team = pd.merge(
+                merged[merged["position"] == "QB"],
+                team_game[["game_id", "dropbacks"]],
+                on="game_id",
+                how="left"
+            )
+            qb_with_team = qb_with_team[qb_with_team["dropbacks"] > 0]
+            if len(qb_with_team) > 0:
+                qb_with_team["pass_attempt_share"] = qb_with_team["pass_attempts"] / qb_with_team["dropbacks"]
+                self.positional_avgs["pass_attempt_share"] = {"QB": qb_with_team["pass_attempt_share"].mean()}
         
         # Team volume averages (dropbacks and rushes per game)
         if "dropbacks" not in team_game.columns:
@@ -232,6 +251,92 @@ class BaselineRoleModel:
         
         return pd.Series(predictions, index=features.index)
     
+    def predict_pass_attempts(
+        self,
+        features: pd.DataFrame,
+        player_game: pd.DataFrame,
+        team_game: pd.DataFrame,
+        players: pd.DataFrame,
+        games: pd.DataFrame
+    ) -> pd.Series:
+        """
+        Predict pass attempts for QBs using baseline: weighted avg of last3 + (season share × projected team volume).
+        """
+        predictions = []
+        
+        for idx, row in features.iterrows():
+            player_id = row["player_id"]
+            game_id = row["game_id"]
+            
+            # Get player position - only predict for QBs
+            player_info = players[players["player_id"] == player_id]
+            if len(player_info) == 0 or player_info.iloc[0]["position"] != "QB":
+                predictions.append(0.0)
+                continue
+            
+            # Get player's last 3 games
+            game_date = games[games["game_id"] == game_id]["date"].iloc[0]
+            prior_games = player_game[
+                (player_game["player_id"] == player_id) &
+                (player_game["game_id"].isin(
+                    games[games["date"] < game_date]["game_id"]
+                ))
+            ].sort_values("game_id").tail(3)
+            
+            # Weighted average of last 3 (more recent = higher weight)
+            if len(prior_games) > 0 and "pass_attempts" in prior_games.columns:
+                weights = np.array([0.5, 0.3, 0.2][-len(prior_games):])
+                weights = weights / weights.sum()
+                last3_avg = (prior_games["pass_attempts"].values * weights).sum()
+            else:
+                last3_avg = 0
+            
+            # Season-to-date pass attempt share
+            season_games = player_game[
+                (player_game["player_id"] == player_id) &
+                (player_game["game_id"].isin(
+                    games[(games["date"] < game_date) & (games["season"] == row["season"])]["game_id"]
+                ))
+            ]
+            
+            if len(season_games) > 0 and "pass_attempts" in season_games.columns:
+                # Get team dropbacks for these games
+                season_with_team = pd.merge(
+                    season_games,
+                    team_game[["game_id", "dropbacks"]],
+                    on="game_id",
+                    how="left"
+                )
+                season_with_team = season_with_team[season_with_team["dropbacks"] > 0]
+                
+                if len(season_with_team) > 0:
+                    season_pass_attempts = season_with_team["pass_attempts"].sum()
+                    season_dropbacks = season_with_team["dropbacks"].sum()
+                    season_share = season_pass_attempts / season_dropbacks if season_dropbacks > 0 else 0
+                else:
+                    season_share = self.positional_avgs.get("pass_attempt_share", {}).get("QB", 0.95)  # Default QB share
+            else:
+                season_share = self.positional_avgs.get("pass_attempt_share", {}).get("QB", 0.95)
+            
+            # Projected team dropbacks (average of last 3 games)
+            team_prior = team_game[
+                (team_game["team"] == row["team"]) &
+                (team_game["game_id"].isin(
+                    games[games["date"] < game_date]["game_id"]
+                ))
+            ].sort_values("game_id").tail(3)
+            
+            if len(team_prior) > 0:
+                proj_team_dropbacks = team_prior["dropbacks"].mean()
+            else:
+                proj_team_dropbacks = self.team_volume_avgs.get("dropbacks", 35.0)
+            
+            # Combine: 60% last3 avg, 40% (season share × projected team volume)
+            pred = 0.6 * last3_avg + 0.4 * (season_share * proj_team_dropbacks)
+            predictions.append(max(0.0, pred))
+        
+        return pd.Series(predictions, index=features.index)
+    
     def predict_carries(
         self,
         features: pd.DataFrame,
@@ -329,6 +434,16 @@ class BaselineEfficiencyModel:
         self.positional_avgs["epa_per_rush"] = compute_positional_averages(
             player_game, players, "epa_per_rush"
         )
+        
+        # Compute positional averages for QB metrics
+        if "epa_per_attempt" in player_game.columns:
+            self.positional_avgs["epa_per_attempt"] = compute_positional_averages(
+                player_game, players, "epa_per_attempt"
+            )
+        if "completion_rate" in player_game.columns:
+            self.positional_avgs["completion_rate"] = compute_positional_averages(
+                player_game, players, "completion_rate"
+            )
     
     def predict_epa_per_target(
         self,
@@ -363,6 +478,118 @@ class BaselineEfficiencyModel:
                     player_mean, pos_mean, int(n_targets), 30, position, "targets"
                 )
                 predictions.append(shrunk)
+        
+        return pd.Series(predictions, index=features.index)
+    
+    def predict_epa_per_attempt(
+        self,
+        features: pd.DataFrame,
+        player_game: pd.DataFrame,
+        players: pd.DataFrame,
+        games: pd.DataFrame
+    ) -> pd.Series:
+        """
+        Predict EPA per attempt for QBs using shrinkage.
+        """
+        predictions = []
+        
+        for idx, row in features.iterrows():
+            player_id = row["player_id"]
+            game_id = row["game_id"]
+            
+            # Get player position - only predict for QBs
+            player_info = players[players["player_id"] == player_id]
+            if len(player_info) == 0 or player_info.iloc[0]["position"] != "QB":
+                predictions.append(0.0)
+                continue
+            
+            position = "QB"
+            
+            # Get player's last 6 games
+            game_date = games[games["game_id"] == game_id]["date"].iloc[0]
+            prior_games = player_game[
+                (player_game["player_id"] == player_id) &
+                (player_game["game_id"].isin(
+                    games[games["date"] < game_date]["game_id"]
+                ))
+            ].sort_values("game_id").tail(6)
+            
+            # Compute player's observed EPA per attempt
+            if len(prior_games) > 0 and "pass_attempts" in prior_games.columns:
+                total_attempts = prior_games["pass_attempts"].sum()
+                if total_attempts > 0:
+                    player_mean = prior_games["epa_passing"].sum() / total_attempts
+                else:
+                    player_mean = 0.0
+            else:
+                player_mean = 0.0
+            
+            # Get positional average
+            position_mean = self.positional_avgs.get("epa_per_attempt", {}).get(position, 0.0)
+            
+            # Apply shrinkage
+            n_opportunities = int(total_attempts) if len(prior_games) > 0 and "pass_attempts" in prior_games.columns else 0
+            shrunk = apply_shrinkage(
+                player_mean, position_mean, n_opportunities, 50, position, "pass_attempts"
+            )
+            
+            predictions.append(shrunk)
+        
+        return pd.Series(predictions, index=features.index)
+    
+    def predict_completion_rate(
+        self,
+        features: pd.DataFrame,
+        player_game: pd.DataFrame,
+        players: pd.DataFrame,
+        games: pd.DataFrame
+    ) -> pd.Series:
+        """
+        Predict completion rate for QBs using shrinkage.
+        """
+        predictions = []
+        
+        for idx, row in features.iterrows():
+            player_id = row["player_id"]
+            game_id = row["game_id"]
+            
+            # Get player position - only predict for QBs
+            player_info = players[players["player_id"] == player_id]
+            if len(player_info) == 0 or player_info.iloc[0]["position"] != "QB":
+                predictions.append(0.0)
+                continue
+            
+            position = "QB"
+            
+            # Get player's last 6 games
+            game_date = games[games["game_id"] == game_id]["date"].iloc[0]
+            prior_games = player_game[
+                (player_game["player_id"] == player_id) &
+                (player_game["game_id"].isin(
+                    games[games["date"] < game_date]["game_id"]
+                ))
+            ].sort_values("game_id").tail(6)
+            
+            # Compute player's observed completion rate
+            if len(prior_games) > 0 and "pass_attempts" in prior_games.columns:
+                total_attempts = prior_games["pass_attempts"].sum()
+                if total_attempts > 0:
+                    player_mean = prior_games["completions"].sum() / total_attempts
+                else:
+                    player_mean = 0.0
+            else:
+                player_mean = 0.0
+            
+            # Get positional average
+            position_mean = self.positional_avgs.get("completion_rate", {}).get(position, 0.65)
+            
+            # Apply shrinkage
+            n_opportunities = int(total_attempts) if len(prior_games) > 0 and "pass_attempts" in prior_games.columns else 0
+            shrunk = apply_shrinkage(
+                player_mean, position_mean, n_opportunities, 50, position, "pass_attempts"
+            )
+            
+            predictions.append(shrunk)
         
         return pd.Series(predictions, index=features.index)
     
@@ -408,8 +635,10 @@ class MLRoleModel:
         self.position_specific = position_specific
         self.targets_model = None
         self.carries_model = None
+        self.pass_attempts_model = None  # QB model
         self.scaler = StandardScaler()
         self.feature_cols = None
+        self.kwargs = {}  # Store kwargs for model initialization
         
         # Position-specific models
         if position_specific:
@@ -417,31 +646,51 @@ class MLRoleModel:
                 "WR": {"targets": None, "carries": None, "scaler": StandardScaler()},
                 "RB": {"targets": None, "carries": None, "scaler": StandardScaler()},
                 "TE": {"targets": None, "carries": None, "scaler": StandardScaler()},
+                "QB": {"pass_attempts": None, "scaler": StandardScaler()},
             }
     
-    def _get_feature_cols(self, features: pd.DataFrame) -> list:
+    def _get_feature_cols(self, features: pd.DataFrame, for_qb: bool = False) -> list:
         """Get feature columns for modeling."""
-        cols = [
-            # Rolling role stats
-            "targets_last1", "targets_last3", "targets_last6",
-            "carries_last1", "carries_last3", "carries_last6",
-            # Shares (important for role prediction)
-            "target_share_last3", "target_share_last6",
-            "carry_share_last3", "carry_share_last6",
-            # Trends
-            "target_share_slope_3", "carry_share_slope_3",
-            # Context
-            "team_pass_rate_last6", "team_plays_last6",
-            # Opponent
-            "opp_def_epa_allowed_last6",
-            # Efficiency features (can help predict role - efficient players get more opportunities)
-            "epa_per_target_last6", "epa_per_rush_last6",
-            "success_rate_last6",
-        ]
+        if for_qb:
+            # QB-specific features
+            cols = [
+                # Rolling role stats
+                "pass_attempts_last1", "pass_attempts_last3", "pass_attempts_last6",
+                # Shares (QB's share of team dropbacks)
+                "pass_attempt_share_last3", "pass_attempt_share_last6",
+                # Trends
+                "pass_attempt_share_slope_3",
+                # Team context
+                "team_pass_rate_last6", "team_plays_last6",
+                # Opponent defense
+                "opp_def_pass_epa_allowed_last6",
+                # Efficiency features
+                "completion_rate_last6", "epa_per_attempt_last6",
+            ]
+        else:
+            # Skill position features
+            cols = [
+                # Rolling role stats (raw counts)
+                "targets_last1", "targets_last3", "targets_last6",
+                "carries_last1", "carries_last3", "carries_last6",
+                # Shares (CRITICAL for target prediction - player's share of team targets)
+                "target_share_last3", "target_share_last6",
+                "carry_share_last3", "carry_share_last6",
+                # Trends (is share increasing/decreasing?)
+                "target_share_slope_3", "carry_share_slope_3",
+                # Team context (CRITICAL - projected team volume)
+                "team_pass_rate_last6", "team_plays_last6",
+                # Opponent defense
+                "opp_def_epa_allowed_last6",
+                # Efficiency features (efficient players may get more targets)
+                "epa_per_target_last6", "epa_per_rush_last6",
+                "success_rate_last6",
+            ]
         # Only include columns that exist
         return [c for c in cols if c in features.columns]
     
-    def fit(self, features: pd.DataFrame, player_game: pd.DataFrame, players: Optional[pd.DataFrame] = None):
+    def fit(self, features: pd.DataFrame, player_game: pd.DataFrame, players: Optional[pd.DataFrame] = None,
+            team_game: Optional[pd.DataFrame] = None, games: Optional[pd.DataFrame] = None):
         """Fit ML models for targets and carries."""
         # Merge with players to get position if not already there
         if players is not None and "position" not in features.columns:
@@ -452,7 +701,59 @@ class MLRoleModel:
                 how="left"
             )
         
+        # Add team volume features (critical for target prediction)
+        if team_game is not None and games is not None:
+            # Get projected team dropbacks for each game
+            features = pd.merge(features, games[["game_id", "date"]], on="game_id", how="left")
+            
+            # For each feature row, get team's projected dropbacks (last 6 games before this game)
+            proj_dropbacks = []
+            proj_rushes = []
+            
+            for idx, row in features.iterrows():
+                team = row["team"]
+                game_date = row["date"]
+                
+                # Get team's last 6 games before this game
+                team_prior = team_game[
+                    (team_game["team"] == team) &
+                    (team_game["game_id"].isin(
+                        games[games["date"] < game_date]["game_id"]
+                    ))
+                ].tail(6)
+                
+                if len(team_prior) > 0:
+                    proj_dropbacks.append(team_prior["dropbacks"].mean())
+                    proj_rushes.append(team_prior["rushes"].mean())
+                else:
+                    # Fallback to overall average
+                    proj_dropbacks.append(team_game["dropbacks"].mean() if len(team_game) > 0 else 35.0)
+                    proj_rushes.append(team_game["rushes"].mean() if len(team_game) > 0 else 25.0)
+            
+            features["proj_team_dropbacks"] = proj_dropbacks
+            features["proj_team_rushes"] = proj_rushes
+            
+            # Create interaction features: share × projected volume (like baseline does)
+            if "target_share_last6" in features.columns:
+                features["target_share_x_proj_dropbacks"] = (
+                    features["target_share_last6"].fillna(0) * features["proj_team_dropbacks"]
+                )
+            if "carry_share_last6" in features.columns:
+                features["carry_share_x_proj_rushes"] = (
+                    features["carry_share_last6"].fillna(0) * features["proj_team_rushes"]
+                )
+        
         self.feature_cols = self._get_feature_cols(features)
+        
+        # Add team volume features to feature list
+        if "proj_team_dropbacks" in features.columns:
+            self.feature_cols.append("proj_team_dropbacks")
+        if "proj_team_rushes" in features.columns:
+            self.feature_cols.append("proj_team_rushes")
+        if "target_share_x_proj_dropbacks" in features.columns:
+            self.feature_cols.append("target_share_x_proj_dropbacks")
+        if "carry_share_x_proj_rushes" in features.columns:
+            self.feature_cols.append("carry_share_x_proj_rushes")
         
         # Merge with actuals
         merged = pd.merge(
@@ -485,14 +786,19 @@ class MLRoleModel:
                     self.position_models[position]["targets"] = PoissonRegressor(alpha=0.5)
                     self.position_models[position]["carries"] = PoissonRegressor(alpha=0.5)
                 elif self.model_type == "gbm":
-                    self.position_models[position]["targets"] = GradientBoostingRegressor(
-                        n_estimators=100, max_depth=3, learning_rate=0.05,
-                        subsample=0.8, min_samples_split=20
-                    )
-                    self.position_models[position]["carries"] = GradientBoostingRegressor(
-                        n_estimators=100, max_depth=3, learning_rate=0.05,
-                        subsample=0.8, min_samples_split=20
-                    )
+                    # Use kwargs if provided, otherwise use defaults
+                    gbm_kwargs = self.kwargs.copy() if self.kwargs else {}
+                    default_gbm = {
+                        "n_estimators": 100,
+                        "max_depth": 3,
+                        "learning_rate": 0.05,
+                        "subsample": 0.8,
+                        "min_samples_split": 20
+                    }
+                    default_gbm.update(gbm_kwargs)
+                    
+                    self.position_models[position]["targets"] = GradientBoostingRegressor(**default_gbm)
+                    self.position_models[position]["carries"] = GradientBoostingRegressor(**default_gbm)
                 else:
                     raise ValueError(f"Unknown model type: {self.model_type}")
                 
@@ -519,28 +825,94 @@ class MLRoleModel:
             self.targets_model = PoissonRegressor(alpha=0.5)
             self.carries_model = PoissonRegressor(alpha=0.5)
         elif self.model_type == "gbm":
-            # Better defaults for GBM
-            self.targets_model = GradientBoostingRegressor(
-                n_estimators=100, 
-                max_depth=3, 
-                learning_rate=0.05,
-                subsample=0.8,
-                min_samples_split=20
-            )
-            self.carries_model = GradientBoostingRegressor(
-                n_estimators=100, 
-                max_depth=3, 
-                learning_rate=0.05,
-                subsample=0.8,
-                min_samples_split=20
-            )
+            # Use kwargs if provided, otherwise use defaults
+            gbm_kwargs = self.kwargs.copy() if self.kwargs else {}
+            default_gbm = {
+                "n_estimators": 100,
+                "max_depth": 3,
+                "learning_rate": 0.05,
+                "subsample": 0.8,
+                "min_samples_split": 20
+            }
+            default_gbm.update(gbm_kwargs)
+            
+            self.targets_model = GradientBoostingRegressor(**default_gbm)
+            self.carries_model = GradientBoostingRegressor(**default_gbm)
         else:
             raise ValueError(f"Unknown model type: {self.model_type}")
         
         self.targets_model.fit(X_scaled, y_targets)
         self.carries_model.fit(X_scaled, y_carries)
+        
+        # Fit QB pass attempts model if we have QB data
+        if "pass_attempts" in merged.columns:
+            qb_data = merged[merged["position"] == "QB"] if "position" in merged.columns else pd.DataFrame()
+            if len(qb_data) > 0:
+                qb_feature_cols = self._get_feature_cols(features, for_qb=True)
+                if len(qb_feature_cols) > 0:
+                    # Add team volume features for QBs
+                    if team_game is not None and games is not None:
+                        if "proj_team_dropbacks" not in qb_data.columns:
+                            qb_data = pd.merge(qb_data, games[["game_id", "date"]], on="game_id", how="left")
+                            proj_dropbacks = []
+                            for idx, row in qb_data.iterrows():
+                                team = row["team"]
+                                game_date = row["date"]
+                                team_prior = team_game[
+                                    (team_game["team"] == team) &
+                                    (team_game["game_id"].isin(
+                                        games[games["date"] < game_date]["game_id"]
+                                    ))
+                                ].tail(6)
+                                proj_dropbacks.append(team_prior["dropbacks"].mean() if len(team_prior) > 0 else 35.0)
+                            qb_data["proj_team_dropbacks"] = proj_dropbacks
+                            if "pass_attempt_share_last6" in qb_data.columns:
+                                qb_data["pass_attempt_share_x_proj_dropbacks"] = (
+                                    qb_data["pass_attempt_share_last6"].fillna(0) * qb_data["proj_team_dropbacks"]
+                                )
+                    
+                    X_qb = qb_data[qb_feature_cols].fillna(0)
+                    for col in qb_feature_cols:
+                        if col not in X_qb.columns:
+                            X_qb[col] = 0.0
+                    
+                    if "proj_team_dropbacks" in qb_data.columns:
+                        qb_feature_cols.append("proj_team_dropbacks")
+                        X_qb["proj_team_dropbacks"] = qb_data["proj_team_dropbacks"]
+                    if "pass_attempt_share_x_proj_dropbacks" in qb_data.columns:
+                        qb_feature_cols.append("pass_attempt_share_x_proj_dropbacks")
+                        X_qb["pass_attempt_share_x_proj_dropbacks"] = qb_data["pass_attempt_share_x_proj_dropbacks"]
+                    
+                    X_qb = X_qb[qb_feature_cols].fillna(0)
+                    y_pass_attempts = qb_data["pass_attempts"]
+                    
+                    if len(X_qb) > 0:
+                        qb_scaler = StandardScaler()
+                        X_qb_scaled = qb_scaler.fit_transform(X_qb)
+                        
+                        if self.model_type == "ridge":
+                            self.pass_attempts_model = Ridge(alpha=0.5)
+                        elif self.model_type == "poisson":
+                            self.pass_attempts_model = PoissonRegressor(alpha=0.5)
+                        elif self.model_type == "gbm":
+                            gbm_kwargs = self.kwargs.copy() if self.kwargs else {}
+                            default_gbm = {
+                                "n_estimators": 100,
+                                "max_depth": 3,
+                                "learning_rate": 0.05,
+                                "subsample": 0.8,
+                                "min_samples_split": 20
+                            }
+                            default_gbm.update(gbm_kwargs)
+                            self.pass_attempts_model = GradientBoostingRegressor(**default_gbm)
+                        
+                        self.pass_attempts_model.fit(X_qb_scaled, y_pass_attempts)
+                        self.qb_feature_cols = qb_feature_cols
+                        self.qb_scaler = qb_scaler
+                        logger.info(f"Fitted QB pass attempts model with {len(X_qb)} samples")
     
-    def predict_targets(self, features: pd.DataFrame, players: Optional[pd.DataFrame] = None) -> pd.Series:
+    def predict_targets(self, features: pd.DataFrame, players: Optional[pd.DataFrame] = None,
+                        team_game: Optional[pd.DataFrame] = None, games: Optional[pd.DataFrame] = None) -> pd.Series:
         """Predict targets."""
         if self.targets_model is None:
             raise ValueError("Model not fitted")
@@ -555,7 +927,55 @@ class MLRoleModel:
                     how="left"
                 )
         
-        X = features[self.feature_cols].fillna(0)
+        # Add team volume features if not already present and we have the data
+        if team_game is not None and games is not None:
+            if "proj_team_dropbacks" not in features.columns:
+                features = pd.merge(features, games[["game_id", "date"]], on="game_id", how="left")
+                
+                proj_dropbacks = []
+                for idx, row in features.iterrows():
+                    team = row["team"]
+                    game_date = row["date"]
+                    
+                    team_prior = team_game[
+                        (team_game["team"] == team) &
+                        (team_game["game_id"].isin(
+                            games[games["date"] < game_date]["game_id"]
+                        ))
+                    ].tail(6)
+                    
+                    if len(team_prior) > 0:
+                        proj_dropbacks.append(team_prior["dropbacks"].mean())
+                    else:
+                        proj_dropbacks.append(team_game["dropbacks"].mean() if len(team_game) > 0 else 35.0)
+                
+                features["proj_team_dropbacks"] = proj_dropbacks
+                
+                # Add interaction features
+                if "target_share_last6" in features.columns:
+                    features["target_share_x_proj_dropbacks"] = (
+                        features["target_share_last6"].fillna(0) * features["proj_team_dropbacks"]
+                    )
+        
+        # Ensure all feature columns exist - add missing ones with zeros
+        X = features.copy()
+        for col in self.feature_cols:
+            if col not in X.columns:
+                X[col] = 0.0
+        
+        # Select only the feature columns we need, in the right order
+        # Only select columns that actually exist (in case feature_cols has extras)
+        available_cols = [c for c in self.feature_cols if c in X.columns]
+        X = X[available_cols].fillna(0)
+        
+        # If we're missing columns, add zeros for them (model was trained with them)
+        for col in self.feature_cols:
+            if col not in X.columns:
+                X[col] = 0.0
+        
+        # Now select in the right order
+        X = X[self.feature_cols].fillna(0)
+        
         preds = []
         
         if self.position_specific and "position" in features.columns:
@@ -581,7 +1001,8 @@ class MLRoleModel:
         
         return pd.Series(np.maximum(0, preds), index=features.index)
     
-    def predict_carries(self, features: pd.DataFrame, players: Optional[pd.DataFrame] = None) -> pd.Series:
+    def predict_carries(self, features: pd.DataFrame, players: Optional[pd.DataFrame] = None,
+                       team_game: Optional[pd.DataFrame] = None, games: Optional[pd.DataFrame] = None) -> pd.Series:
         """Predict carries."""
         if self.carries_model is None:
             raise ValueError("Model not fitted")
@@ -596,7 +1017,24 @@ class MLRoleModel:
                     how="left"
                 )
         
-        X = features[self.feature_cols].fillna(0)
+        # Ensure all feature columns exist - add missing ones with zeros
+        X = features.copy()
+        for col in self.feature_cols:
+            if col not in X.columns:
+                X[col] = 0.0
+        
+        # Select only the feature columns we need, in the right order
+        # Only select columns that actually exist (in case feature_cols has extras)
+        available_cols = [c for c in self.feature_cols if c in X.columns]
+        X = X[available_cols].fillna(0)
+        
+        # If we're missing columns, add zeros for them (model was trained with them)
+        for col in self.feature_cols:
+            if col not in X.columns:
+                X[col] = 0.0
+        
+        # Now select in the right order
+        X = X[self.feature_cols].fillna(0)
         preds = []
         
         if self.position_specific and "position" in features.columns:
@@ -621,6 +1059,213 @@ class MLRoleModel:
             preds = self.carries_model.predict(X_scaled)
         
         return pd.Series(np.maximum(0, preds), index=features.index)
+    
+    def predict_pass_attempts(self, features: pd.DataFrame, players: Optional[pd.DataFrame] = None,
+                              team_game: Optional[pd.DataFrame] = None, games: Optional[pd.DataFrame] = None) -> pd.Series:
+        """Predict pass attempts for QBs."""
+        # If no QB model, return zeros
+        if not hasattr(self, 'pass_attempts_model') or self.pass_attempts_model is None:
+            return pd.Series([0.0] * len(features), index=features.index)
+        
+        # Get position if available
+        if players is not None:
+            if "position" not in features.columns:
+                features = pd.merge(
+                    features,
+                    players[["player_id", "position"]],
+                    on="player_id",
+                    how="left"
+                )
+        
+        # Filter to QBs only
+        qb_features = features[features["position"] == "QB"].copy() if "position" in features.columns else pd.DataFrame()
+        if len(qb_features) == 0:
+            return pd.Series([0.0] * len(features), index=features.index)
+        
+        # Add team volume features if not already present
+        if team_game is not None and games is not None:
+            if "proj_team_dropbacks" not in qb_features.columns:
+                qb_features = pd.merge(qb_features, games[["game_id", "date"]], on="game_id", how="left")
+                proj_dropbacks = []
+                for idx, row in qb_features.iterrows():
+                    team = row["team"]
+                    game_date = row["date"]
+                    team_prior = team_game[
+                        (team_game["team"] == team) &
+                        (team_game["game_id"].isin(
+                            games[games["date"] < game_date]["game_id"]
+                        ))
+                    ].tail(6)
+                    proj_dropbacks.append(team_prior["dropbacks"].mean() if len(team_prior) > 0 else 35.0)
+                qb_features["proj_team_dropbacks"] = proj_dropbacks
+                if "pass_attempt_share_last6" in qb_features.columns:
+                    qb_features["pass_attempt_share_x_proj_dropbacks"] = (
+                        qb_features["pass_attempt_share_last6"].fillna(0) * qb_features["proj_team_dropbacks"]
+                    )
+        
+        # Ensure all QB feature columns exist
+        X_qb = qb_features.copy()
+        qb_feature_cols = getattr(self, 'qb_feature_cols', self._get_feature_cols(qb_features, for_qb=True))
+        for col in qb_feature_cols:
+            if col not in X_qb.columns:
+                X_qb[col] = 0.0
+        
+        # Add team volume features if they exist
+        if "proj_team_dropbacks" in qb_features.columns and "proj_team_dropbacks" not in qb_feature_cols:
+            qb_feature_cols.append("proj_team_dropbacks")
+        if "pass_attempt_share_x_proj_dropbacks" in qb_features.columns and "pass_attempt_share_x_proj_dropbacks" not in qb_feature_cols:
+            qb_feature_cols.append("pass_attempt_share_x_proj_dropbacks")
+        
+        X_qb = X_qb[qb_feature_cols].fillna(0)
+        
+        # Scale and predict
+        qb_scaler = getattr(self, 'qb_scaler', StandardScaler())
+        X_qb_scaled = qb_scaler.transform(X_qb)
+        qb_preds = self.pass_attempts_model.predict(X_qb_scaled)
+        
+        # Create full predictions series (zeros for non-QBs)
+        all_preds = pd.Series([0.0] * len(features), index=features.index)
+        all_preds.loc[qb_features.index] = np.maximum(0, qb_preds)
+        
+        return all_preds
+
+
+class BaselineDefenseModel:
+    """Baseline model for defense prediction (tackles, sacks, interceptions)."""
+    
+    def __init__(self):
+        self.positional_avgs = {}
+        self.team_volume_avgs = {}
+    
+    def fit(self, player_game_defense: pd.DataFrame, team_game_defense: pd.DataFrame, players: pd.DataFrame):
+        """Fit baseline defense model."""
+        merged = pd.merge(player_game_defense, players[["player_id", "position"]], on="player_id", how="left")
+        
+        # Tackles per game by position
+        self.positional_avgs["tackles_per_game"] = merged.groupby("position")["tackles"].mean().to_dict()
+        
+        # Sacks per game by position
+        self.positional_avgs["sacks_per_game"] = merged.groupby("position")["sacks"].mean().to_dict()
+        
+        # Interceptions per game by position
+        self.positional_avgs["interceptions_per_game"] = merged.groupby("position")["interceptions"].mean().to_dict()
+        
+        # Team volume averages
+        if "plays_faced" in team_game_defense.columns:
+            self.team_volume_avgs["plays_faced"] = team_game_defense["plays_faced"].mean()
+        else:
+            self.team_volume_avgs["plays_faced"] = 65.0  # Default
+    
+    def predict_tackles(
+        self,
+        features: pd.DataFrame,
+        player_game_defense: pd.DataFrame,
+        team_game_defense: pd.DataFrame,
+        players: pd.DataFrame,
+        games: pd.DataFrame
+    ) -> pd.Series:
+        """Predict tackles using baseline: weighted avg of last 3 games."""
+        predictions = []
+        
+        for idx, row in features.iterrows():
+            player_id = row["player_id"]
+            game_id = row["game_id"]
+            
+            player_info = players[players["player_id"] == player_id]
+            position = player_info.iloc[0]["position"] if len(player_info) > 0 else "LB"
+            
+            game_date = games[games["game_id"] == game_id]["date"].iloc[0]
+            prior_games = player_game_defense[
+                (player_game_defense["player_id"] == player_id) &
+                (player_game_defense["game_id"].isin(
+                    games[games["date"] < game_date]["game_id"]
+                ))
+            ].sort_values("game_id").tail(3)
+            
+            if len(prior_games) > 0:
+                weights = np.array([0.5, 0.3, 0.2][-len(prior_games):])
+                weights = weights / weights.sum()
+                last3_avg = (prior_games["tackles"].values * weights).sum()
+            else:
+                last3_avg = self.positional_avgs.get("tackles_per_game", {}).get(position, 5.0)
+            
+            predictions.append(max(0.0, last3_avg))
+        
+        return pd.Series(predictions, index=features.index)
+    
+    def predict_sacks(
+        self,
+        features: pd.DataFrame,
+        player_game_defense: pd.DataFrame,
+        team_game_defense: pd.DataFrame,
+        players: pd.DataFrame,
+        games: pd.DataFrame
+    ) -> pd.Series:
+        """Predict sacks using baseline: weighted avg of last 3 games."""
+        predictions = []
+        
+        for idx, row in features.iterrows():
+            player_id = row["player_id"]
+            game_id = row["game_id"]
+            
+            player_info = players[players["player_id"] == player_id]
+            position = player_info.iloc[0]["position"] if len(player_info) > 0 else "DE"
+            
+            game_date = games[games["game_id"] == game_id]["date"].iloc[0]
+            prior_games = player_game_defense[
+                (player_game_defense["player_id"] == player_id) &
+                (player_game_defense["game_id"].isin(
+                    games[games["date"] < game_date]["game_id"]
+                ))
+            ].sort_values("game_id").tail(3)
+            
+            if len(prior_games) > 0:
+                weights = np.array([0.5, 0.3, 0.2][-len(prior_games):])
+                weights = weights / weights.sum()
+                last3_avg = (prior_games["sacks"].values * weights).sum()
+            else:
+                last3_avg = self.positional_avgs.get("sacks_per_game", {}).get(position, 0.5)
+            
+            predictions.append(max(0.0, last3_avg))
+        
+        return pd.Series(predictions, index=features.index)
+    
+    def predict_interceptions(
+        self,
+        features: pd.DataFrame,
+        player_game_defense: pd.DataFrame,
+        team_game_defense: pd.DataFrame,
+        players: pd.DataFrame,
+        games: pd.DataFrame
+    ) -> pd.Series:
+        """Predict interceptions using baseline: weighted avg of last 3 games."""
+        predictions = []
+        
+        for idx, row in features.iterrows():
+            player_id = row["player_id"]
+            game_id = row["game_id"]
+            
+            player_info = players[players["player_id"] == player_id]
+            position = player_info.iloc[0]["position"] if len(player_info) > 0 else "DB"
+            
+            game_date = games[games["game_id"] == game_id]["date"].iloc[0]
+            prior_games = player_game_defense[
+                (player_game_defense["player_id"] == player_id) &
+                (player_game_defense["game_id"].isin(
+                    games[games["date"] < game_date]["game_id"]
+                ))
+            ].sort_values("game_id").tail(3)
+            
+            if len(prior_games) > 0:
+                weights = np.array([0.5, 0.3, 0.2][-len(prior_games):])
+                weights = weights / weights.sum()
+                last3_avg = (prior_games["interceptions"].values * weights).sum()
+            else:
+                last3_avg = self.positional_avgs.get("interceptions_per_game", {}).get(position, 0.2)
+            
+            predictions.append(max(0.0, last3_avg))
+        
+        return pd.Series(predictions, index=features.index)
 
 
 def project_player(

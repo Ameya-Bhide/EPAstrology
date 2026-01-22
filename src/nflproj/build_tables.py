@@ -158,6 +158,7 @@ def build_player_game_offense_table(
     # nfl_data_py may use different column names
     target_id_col = None
     rusher_id_col = None
+    passer_id_col = None
     
     for col in ["target_player_id", "receiver_player_id", "receiver_id", "target_id"]:
         if col in offense_plays.columns:
@@ -167,6 +168,11 @@ def build_player_game_offense_table(
     for col in ["rusher_player_id", "rusher_id", "carrier_id"]:
         if col in offense_plays.columns:
             rusher_id_col = col
+            break
+    
+    for col in ["passer_player_id", "passer_id", "qb_player_id"]:
+        if col in offense_plays.columns:
+            passer_id_col = col
             break
     
     if target_id_col is None:
@@ -188,6 +194,18 @@ def build_player_game_offense_table(
             rusher_id_col = "rusher_player_name"
         else:
             raise ValueError("Could not find rusher/carrier player identifier in pbp data")
+    
+    if passer_id_col is None:
+        logger.warning("Could not find passer player ID column. Available columns: " + 
+                      str([c for c in offense_plays.columns if 'passer' in c.lower() or 'qb' in c.lower()]))
+        # Try to use passer from names if available
+        if "passer_player_name" in offense_plays.columns:
+            logger.info("Using passer_player_name to identify passers")
+            passer_id_col = "passer_player_name"
+        else:
+            # QB stats are optional - don't fail if not found
+            logger.info("QB stats will not be included (passer ID column not found)")
+            passer_id_col = None
     
     # Passing stats (targets, receptions, receiving yards, EPA)
     pass_plays = offense_plays[offense_plays["play_type"] == "pass"].copy()
@@ -255,7 +273,37 @@ def build_player_game_offense_table(
         carries = pd.DataFrame(columns=["game_id", "player_id", "team", "carries",
                                        "rushing_yards", "epa_rushing", "success_rushing"])
     
-    # Merge targets and carries
+    # QB passing stats (pass attempts, completions, passing yards, TDs, INTs, EPA)
+    qb_stats = pd.DataFrame()
+    if passer_id_col and passer_id_col in pass_plays.columns:
+        pass_plays_with_passer = pass_plays[pass_plays[passer_id_col].notna()].copy()
+        
+        if len(pass_plays_with_passer) > 0:
+            qb_stats = pass_plays_with_passer.groupby(
+                ["game_id", passer_id_col, "posteam"]
+            ).agg({
+                "play_id": "count",  # Pass attempts
+                "complete_pass": "sum",  # Completions
+                "yards_gained": "sum",  # Passing yards
+                "touchdown": lambda x: (x == 1).sum(),  # Passing TDs
+                "interception": lambda x: (x == 1).sum(),  # Interceptions
+                "epa": "sum",  # EPA from passing
+                "success": "sum"  # Successful passes
+            }).reset_index()
+            
+            qb_stats = qb_stats.rename(columns={
+                passer_id_col: "player_id",
+                "posteam": "team",
+                "play_id": "pass_attempts",
+                "complete_pass": "completions",
+                "yards_gained": "passing_yards",
+                "touchdown": "passing_tds",
+                "interception": "interceptions",
+                "epa": "epa_passing",
+                "success": "success_passing"
+            })
+    
+    # Merge targets, carries, and QB stats
     player_game = pd.merge(
         targets,
         carries,
@@ -264,16 +312,27 @@ def build_player_game_offense_table(
         suffixes=("", "_rush")
     )
     
+    if len(qb_stats) > 0:
+        player_game = pd.merge(
+            player_game,
+            qb_stats,
+            on=["game_id", "player_id", "team"],
+            how="outer"
+        )
+    
     # Fill missing values with 0
     for col in ["targets", "receptions", "receiving_yards", "epa_receiving", 
                 "success_receiving", "carries", "rushing_yards", "epa_rushing", 
-                "success_rushing"]:
+                "success_rushing", "pass_attempts", "completions", "passing_yards",
+                "passing_tds", "interceptions", "epa_passing", "success_passing"]:
         if col in player_game.columns:
             player_game[col] = player_game[col].fillna(0)
     
-    # Calculate totals
+    # Calculate totals (include QB passing EPA)
     player_game["epa_total"] = (
-        player_game.get("epa_receiving", 0) + player_game.get("epa_rushing", 0)
+        player_game.get("epa_receiving", 0) + 
+        player_game.get("epa_rushing", 0) + 
+        player_game.get("epa_passing", 0)
     )
     
     # EPA per opportunity
@@ -283,6 +342,16 @@ def build_player_game_offense_table(
     )
     player_game["epa_per_rush"] = player_game.apply(
         lambda x: x["epa_rushing"] / x["carries"] if x["carries"] > 0 else 0.0,
+        axis=1
+    )
+    player_game["epa_per_attempt"] = player_game.apply(
+        lambda x: x["epa_passing"] / x["pass_attempts"] if x.get("pass_attempts", 0) > 0 else 0.0,
+        axis=1
+    )
+    
+    # Completion rate for QBs
+    player_game["completion_rate"] = player_game.apply(
+        lambda x: x["completions"] / x["pass_attempts"] if x.get("pass_attempts", 0) > 0 else 0.0,
         axis=1
     )
     
@@ -351,14 +420,25 @@ def build_player_game_offense_table(
         axis=1
     )
     
-    # Select final columns
-    player_game = player_game[[
+    # Select final columns (include QB stats if present)
+    # Include epa_receiving and epa_rushing for transparency
+    base_cols = [
         "game_id", "player_id", "team", "opponent",
         "targets", "receptions", "receiving_yards",
         "carries", "rushing_yards",
-        "epa_total", "epa_per_target", "epa_per_rush",
+        "epa_receiving", "epa_rushing", "epa_total", 
+        "epa_per_target", "epa_per_rush",
         "success_rate", "redzone_touches"
-    ]].copy()
+    ]
+    
+    # Add QB columns if they exist
+    qb_cols = ["pass_attempts", "completions", "passing_yards", "passing_tds", 
+               "interceptions", "epa_passing", "epa_per_attempt", "completion_rate"]
+    final_cols = base_cols + [col for col in qb_cols if col in player_game.columns]
+    
+    # Only select columns that actually exist
+    final_cols = [col for col in final_cols if col in player_game.columns]
+    player_game = player_game[final_cols].copy()
     
     # Sort by game_id, player_id
     player_game = player_game.sort_values(["game_id", "player_id"]).reset_index(drop=True)
@@ -440,6 +520,331 @@ def build_team_game_offense_table(
     return team_stats
 
 
+def build_player_game_defense_table(
+    pbp: pd.DataFrame,
+    rosters: pd.DataFrame,
+    games: pd.DataFrame,
+    save_path: Optional[Path] = None
+) -> pd.DataFrame:
+    """
+    Build player_game_defense table from play-by-play data.
+    
+    Schema: game_id, player_id, team, opponent,
+            tackles, solo_tackles, assist_tackles,
+            sacks, qb_hits, interceptions, passes_defended,
+            fumbles_forced, fumbles_recovered,
+            epa_allowed (negative EPA generated by offense against this player's defense)
+    """
+    logger.info("Building player_game_defense table")
+    
+    # Filter to plays with defensive stats
+    defense_plays = pbp[
+        (pbp["epa"].notna()) &
+        (pbp["play_type"].isin(["pass", "run"])) &
+        (pbp["defteam"].notna())
+    ].copy()
+    
+    player_def_stats = []
+    
+    # Find defensive player ID columns
+    sack_id_col = None
+    int_id_col = None
+    tackle_id_cols = []
+    
+    for col in ["sack_player_id", "sack_player", "sacker_id"]:
+        if col in defense_plays.columns:
+            sack_id_col = col
+            break
+    
+    for col in ["interception_player_id", "interception_player", "interceptor_id"]:
+        if col in defense_plays.columns:
+            int_id_col = col
+            break
+    
+    # Tackles - can be solo or assist
+    for col in ["tackle_player_id", "tackle_player", "tackler_id", "solo_tackle_player_id", "assist_tackle_player_id"]:
+        if col in defense_plays.columns:
+            tackle_id_cols.append(col)
+    
+    # Sacks
+    sack_stats = pd.DataFrame()
+    if sack_id_col and sack_id_col in defense_plays.columns:
+        sack_plays = defense_plays[defense_plays["sack"] == 1].copy()
+        if len(sack_plays) > 0:
+            sack_stats = sack_plays.groupby(
+                ["game_id", sack_id_col, "defteam"]
+            ).agg({
+                "sack": "sum",
+                "qb_hit": "sum"  # QB hits often accompany sacks
+            }).reset_index()
+            sack_stats = sack_stats.rename(columns={
+                sack_id_col: "player_id",
+                "defteam": "team",
+                "sack": "sacks"
+            })
+    
+    # Interceptions
+    int_stats = pd.DataFrame()
+    if int_id_col and int_id_col in defense_plays.columns:
+        int_plays = defense_plays[defense_plays["interception"] == 1].copy()
+        if len(int_plays) > 0:
+            int_stats = int_plays.groupby(
+                ["game_id", int_id_col, "defteam"]
+            ).agg({
+                "interception": "sum"
+            }).reset_index()
+            int_stats = int_stats.rename(columns={
+                int_id_col: "player_id",
+                "defteam": "team",
+                "interception": "interceptions"
+            })
+    
+    # Tackles (solo and assist)
+    tackle_stats = pd.DataFrame()
+    if len(tackle_id_cols) > 0:
+        tackle_data = []
+        for col in tackle_id_cols:
+            if col in defense_plays.columns:
+                tackle_plays = defense_plays[defense_plays[col].notna()].copy()
+                if len(tackle_plays) > 0:
+                    # Determine if solo or assist
+                    is_solo = "solo" in col.lower()
+                    tackle_type = "solo_tackles" if is_solo else "assist_tackles"
+                    
+                    tackle_group = tackle_plays.groupby(
+                        ["game_id", col, "defteam"]
+                    ).size().reset_index(name=tackle_type)
+                    tackle_group = tackle_group.rename(columns={col: "player_id", "defteam": "team"})
+                    tackle_data.append(tackle_group)
+        
+        if len(tackle_data) > 0:
+            tackle_stats = tackle_data[0]
+            for df in tackle_data[1:]:
+                tackle_stats = pd.merge(
+                    tackle_stats, df,
+                    on=["game_id", "player_id", "team"],
+                    how="outer",
+                    suffixes=("", "_new")
+                )
+                # Merge duplicate columns
+                for col in df.columns:
+                    if col.endswith("_new"):
+                        base_col = col.replace("_new", "")
+                        if base_col in tackle_stats.columns:
+                            tackle_stats[base_col] = tackle_stats[base_col].fillna(0) + tackle_stats[col].fillna(0)
+                            tackle_stats = tackle_stats.drop(columns=[col])
+    
+    # QB hits (separate from sacks)
+    qb_hit_stats = pd.DataFrame()
+    if "qb_hit_player_id" in defense_plays.columns:
+        qb_hit_plays = defense_plays[defense_plays["qb_hit"] == 1].copy()
+        if len(qb_hit_plays) > 0:
+            qb_hit_stats = qb_hit_plays.groupby(
+                ["game_id", "qb_hit_player_id", "defteam"]
+            ).agg({
+                "qb_hit": "sum"
+            }).reset_index()
+            qb_hit_stats = qb_hit_stats.rename(columns={
+                "qb_hit_player_id": "player_id",
+                "defteam": "team",
+                "qb_hit": "qb_hits"
+            })
+    
+    # Fumbles forced and recovered
+    fumble_stats = pd.DataFrame()
+    if "fumble_forced_player_id" in defense_plays.columns:
+        fumble_forced = defense_plays[defense_plays["fumble_forced"] == 1].copy()
+        if len(fumble_forced) > 0:
+            fumble_forced_stats = fumble_forced.groupby(
+                ["game_id", "fumble_forced_player_id", "defteam"]
+            ).agg({
+                "fumble_forced": "sum"
+            }).reset_index()
+            fumble_forced_stats = fumble_forced_stats.rename(columns={
+                "fumble_forced_player_id": "player_id",
+                "defteam": "team",
+                "fumble_forced": "fumbles_forced"
+            })
+            fumble_stats = fumble_forced_stats
+    
+    # Merge all defensive stats
+    player_def = pd.DataFrame()
+    
+    # Start with tackles (most common)
+    if len(tackle_stats) > 0:
+        player_def = tackle_stats.copy()
+    else:
+        # Create empty DataFrame with required columns
+        player_def = pd.DataFrame(columns=["game_id", "player_id", "team"])
+    
+    # Merge sacks
+    if len(sack_stats) > 0:
+        player_def = pd.merge(
+            player_def, sack_stats[["game_id", "player_id", "team", "sacks"]],
+            on=["game_id", "player_id", "team"],
+            how="outer"
+        )
+    
+    # Merge interceptions
+    if len(int_stats) > 0:
+        player_def = pd.merge(
+            player_def, int_stats[["game_id", "player_id", "team", "interceptions"]],
+            on=["game_id", "player_id", "team"],
+            how="outer"
+        )
+    
+    # Merge QB hits
+    if len(qb_hit_stats) > 0:
+        player_def = pd.merge(
+            player_def, qb_hit_stats[["game_id", "player_id", "team", "qb_hits"]],
+            on=["game_id", "player_id", "team"],
+            how="outer"
+        )
+    
+    # Merge fumbles
+    if len(fumble_stats) > 0:
+        player_def = pd.merge(
+            player_def, fumble_stats[["game_id", "player_id", "team", "fumbles_forced"]],
+            on=["game_id", "player_id", "team"],
+            how="outer"
+        )
+    
+    # Fill missing values with 0
+    for col in ["solo_tackles", "assist_tackles", "sacks", "qb_hits", "interceptions", "fumbles_forced"]:
+        if col in player_def.columns:
+            player_def[col] = player_def[col].fillna(0)
+        else:
+            player_def[col] = 0
+    
+    # Calculate total tackles
+    player_def["tackles"] = (
+        player_def.get("solo_tackles", 0) + 
+        player_def.get("assist_tackles", 0)
+    )
+    
+    # Calculate EPA allowed (negative of offensive EPA when this player's team is on defense)
+    # EPA allowed = -EPA generated by offense
+    if len(player_def) > 0:
+        # Get EPA for plays where this player's team was on defense
+        def_epa = defense_plays.groupby(["game_id", "defteam"]).agg({
+            "epa": "sum"  # This is offensive EPA, so negative = good defense
+        }).reset_index()
+        def_epa = def_epa.rename(columns={"defteam": "team", "epa": "epa_allowed"})
+        def_epa["epa_allowed"] = -def_epa["epa_allowed"]  # Negative because lower offensive EPA = better defense
+        
+        # Merge with player stats (each player gets team's EPA allowed)
+        player_def = pd.merge(
+            player_def, def_epa,
+            on=["game_id", "team"],
+            how="left"
+        )
+        player_def["epa_allowed"] = player_def["epa_allowed"].fillna(0)
+    
+    # Merge with games to get opponent
+    player_def = pd.merge(
+        player_def,
+        games[["game_id", "home_team", "away_team"]],
+        on="game_id",
+        how="left"
+    )
+    player_def["opponent"] = player_def.apply(
+        lambda x: x["away_team"] if x["team"] == x["home_team"] else x["home_team"],
+        axis=1
+    )
+    
+    # Select final columns
+    final_cols = [
+        "game_id", "player_id", "team", "opponent",
+        "tackles", "solo_tackles", "assist_tackles",
+        "sacks", "qb_hits", "interceptions", "fumbles_forced",
+        "epa_allowed"
+    ]
+    final_cols = [col for col in final_cols if col in player_def.columns]
+    player_def = player_def[final_cols].copy()
+    
+    # Sort by game_id, player_id
+    player_def = player_def.sort_values(["game_id", "player_id"]).reset_index(drop=True)
+    
+    if save_path:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        player_def.to_parquet(save_path, index=False, compression="snappy")
+        logger.info(f"Saved player_game_defense table to {save_path}")
+    
+    return player_def
+
+
+def build_team_game_defense_table(
+    pbp: pd.DataFrame,
+    games: pd.DataFrame,
+    save_path: Optional[Path] = None
+) -> pd.DataFrame:
+    """
+    Build team_game_defense table from play-by-play data.
+    
+    Schema: game_id, team,
+            plays_faced, dropbacks_faced, rushes_faced,
+            epa_allowed_per_play, sacks, interceptions, fumbles_forced
+    """
+    logger.info("Building team_game_defense table")
+    
+    # Filter to plays where team was on defense
+    defense_plays = pbp[
+        (pbp["epa"].notna()) &
+        (pbp["play_type"].isin(["pass", "run"])) &
+        (pbp["defteam"].notna())
+    ].copy()
+    
+    # Aggregate by game and defensive team
+    team_def = defense_plays.groupby(["game_id", "defteam"]).agg({
+        "play_id": "count",  # Total plays faced
+        "play_type": lambda x: (x == "pass").sum(),  # Dropbacks faced
+        "epa": "sum",  # Offensive EPA (negative = good defense)
+        "sack": "sum",
+        "interception": "sum",
+        "fumble_forced": "sum"
+    }).reset_index()
+    
+    team_def = team_def.rename(columns={
+        "defteam": "team",
+        "play_id": "plays_faced",
+        "play_type": "dropbacks_faced",
+        "epa": "epa_allowed",
+        "sack": "sacks",
+        "interception": "interceptions",
+        "fumble_forced": "fumbles_forced"
+    })
+    
+    # Calculate rushes faced
+    team_def["rushes_faced"] = team_def["plays_faced"] - team_def["dropbacks_faced"]
+    
+    # EPA allowed per play (negative because lower offensive EPA = better defense)
+    team_def["epa_allowed"] = -team_def["epa_allowed"]
+    team_def["epa_allowed_per_play"] = team_def.apply(
+        lambda x: x["epa_allowed"] / x["plays_faced"] if x["plays_faced"] > 0 else 0.0,
+        axis=1
+    )
+    
+    # Select final columns
+    team_def = team_def[[
+        "game_id", "team",
+        "plays_faced", "dropbacks_faced", "rushes_faced",
+        "epa_allowed", "epa_allowed_per_play",
+        "sacks", "interceptions", "fumbles_forced"
+    ]].copy()
+    
+    # Sort by game_id, team
+    team_def = team_def.sort_values(["game_id", "team"]).reset_index(drop=True)
+    
+    if save_path:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        team_def.to_parquet(save_path, index=False, compression="snappy")
+        logger.info(f"Saved team_game_defense table to {save_path}")
+    
+    return team_def
+
+
 def build_all_tables(
     pbp_path: Optional[Path] = None,
     rosters_path: Optional[Path] = None,
@@ -475,11 +880,21 @@ def build_all_tables(
         pbp, games, output_dir / "team_game_offense.parquet"
     )
     
+    # Build defense tables
+    player_game_defense = build_player_game_defense_table(
+        pbp, rosters, games, output_dir / "player_game_defense.parquet"
+    )
+    team_game_defense = build_team_game_defense_table(
+        pbp, games, output_dir / "team_game_defense.parquet"
+    )
+    
     logger.info("All tables built successfully")
     
     return {
         "games": games,
         "players": players,
         "player_game_offense": player_game_offense,
-        "team_game_offense": team_game_offense
+        "team_game_offense": team_game_offense,
+        "player_game_defense": player_game_defense,
+        "team_game_defense": team_game_defense
     }

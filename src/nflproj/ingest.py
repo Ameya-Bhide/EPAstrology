@@ -29,8 +29,52 @@ def ingest_pbp(seasons: List[int], save_path: Optional[Path] = None) -> pd.DataF
     """
     logger.info(f"Ingesting play-by-play data for seasons {seasons}")
     
+    # Filter out future seasons that don't exist yet
+    from datetime import datetime
+    current_year = datetime.now().year
+    valid_seasons = [s for s in seasons if s <= current_year]
+    invalid_seasons = [s for s in seasons if s > current_year]
+    
+    if invalid_seasons:
+        logger.warning(f"Seasons {invalid_seasons} are in the future and data is not available yet. Skipping.")
+    
+    if not valid_seasons:
+        raise ValueError(f"No valid seasons to ingest. All requested seasons ({seasons}) are in the future.")
+    
     # Fetch play-by-play data
-    pbp = nfl.import_pbp_data(years=seasons, downcast=True)
+    try:
+        pbp = nfl.import_pbp_data(years=valid_seasons, downcast=True)
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Error ingesting PBP data: {error_msg}")
+        
+        # Check if it's the participation data issue (common for future seasons)
+        if "Error" in error_msg or "404" in error_msg or "Not Found" in error_msg:
+            # Try without participation data (for seasons where it's not available)
+            try:
+                logger.info("Retrying without participation data...")
+                pbp = nfl.import_pbp_data(years=valid_seasons, downcast=True, include_participation=False)
+            except Exception as e3:
+                # Try without downcast as well
+                try:
+                    pbp = nfl.import_pbp_data(years=valid_seasons, downcast=False, include_participation=False)
+                except Exception as e4:
+                    logger.error(f"Failed to ingest PBP data: {e4}")
+                    raise ValueError(
+                        f"Failed to ingest PBP data for seasons {valid_seasons}. "
+                        f"This may be because the season data is incomplete or not yet available. "
+                        f"Error: {str(e4)}"
+                    )
+        else:
+            # Try without downcast if that fails
+            try:
+                pbp = nfl.import_pbp_data(years=valid_seasons, downcast=False)
+            except Exception as e2:
+                logger.error(f"Failed to ingest PBP data even without downcast: {e2}")
+                raise ValueError(
+                    f"Failed to ingest PBP data for seasons {valid_seasons}. "
+                    f"Error: {str(e2)}"
+                )
     
     if save_path:
         save_path = Path(save_path)
@@ -145,13 +189,14 @@ def ingest_schedules(seasons: List[int], save_path: Optional[Path] = None) -> pd
     return schedules
 
 
-def ingest_all(seasons: List[int], output_dir: Optional[Path] = None) -> dict:
+def ingest_all(seasons: List[int], output_dir: Optional[Path] = None, append: bool = True) -> dict:
     """
     Ingest all data sources for given seasons.
     
     Args:
         seasons: List of seasons to ingest
         output_dir: Directory to save Parquet files (defaults to PARQUET_DIR)
+        append: If True, merge with existing data. If False, overwrite.
         
     Returns:
         Dictionary with keys: pbp, rosters, schedules
@@ -163,9 +208,65 @@ def ingest_all(seasons: List[int], output_dir: Optional[Path] = None) -> dict:
     data = {}
     
     # Ingest each data source
-    data["pbp"] = ingest_pbp(seasons, output_dir / "pbp.parquet")
-    data["rosters"] = ingest_rosters(seasons, output_dir / "rosters.parquet")
-    data["schedules"] = ingest_schedules(seasons, output_dir / "schedules.parquet")
+    pbp_path = output_dir / "pbp.parquet"
+    rosters_path = output_dir / "rosters.parquet"
+    schedules_path = output_dir / "schedules.parquet"
+    
+    # Ingest new data
+    new_pbp = ingest_pbp(seasons, None)  # Don't save yet
+    new_rosters = ingest_rosters(seasons, None)
+    new_schedules = ingest_schedules(seasons, None)
+    
+    # Merge with existing data if append=True and files exist
+    if append and pbp_path.exists():
+        logger.info("Merging with existing data...")
+        existing_pbp = pd.read_parquet(pbp_path)
+        existing_rosters = pd.read_parquet(rosters_path) if rosters_path.exists() else pd.DataFrame()
+        existing_schedules = pd.read_parquet(schedules_path) if schedules_path.exists() else pd.DataFrame()
+        
+        # Remove duplicates (keep new data if there's overlap)
+        if len(existing_pbp) > 0:
+            # Remove existing seasons from old data
+            if 'season' in existing_pbp.columns:
+                existing_pbp = existing_pbp[~existing_pbp['season'].isin(seasons)]
+            # Combine
+            data["pbp"] = pd.concat([existing_pbp, new_pbp], ignore_index=True)
+        else:
+            data["pbp"] = new_pbp
+        
+        if len(existing_rosters) > 0:
+            # Remove duplicates by player_id and season if available
+            if 'season' in existing_rosters.columns and 'player_id' in existing_rosters.columns:
+                existing_rosters = existing_rosters[
+                    ~(existing_rosters['season'].isin(seasons) & 
+                      existing_rosters['player_id'].isin(new_rosters.get('player_id', pd.Series()).unique()))
+                ]
+            data["rosters"] = pd.concat([existing_rosters, new_rosters], ignore_index=True)
+        else:
+            data["rosters"] = new_rosters
+        
+        if len(existing_schedules) > 0:
+            # Remove duplicates by game_id
+            if 'game_id' in existing_schedules.columns:
+                existing_schedules = existing_schedules[~existing_schedules['game_id'].isin(new_schedules.get('game_id', pd.Series()).unique())]
+            data["schedules"] = pd.concat([existing_schedules, new_schedules], ignore_index=True)
+        else:
+            data["schedules"] = new_schedules
+    else:
+        # No existing data or append=False, use new data only
+        data["pbp"] = new_pbp
+        data["rosters"] = new_rosters
+        data["schedules"] = new_schedules
+    
+    # Save merged data
+    data["pbp"].to_parquet(pbp_path, index=False, compression="snappy")
+    logger.info(f"Saved play-by-play data to {pbp_path} ({len(data['pbp'])} rows)")
+    
+    data["rosters"].to_parquet(rosters_path, index=False, compression="snappy")
+    logger.info(f"Saved roster data to {rosters_path} ({len(data['rosters'])} rows)")
+    
+    data["schedules"].to_parquet(schedules_path, index=False, compression="snappy")
+    logger.info(f"Saved schedule data to {schedules_path} ({len(data['schedules'])} rows)")
     
     logger.info("Ingestion complete")
     

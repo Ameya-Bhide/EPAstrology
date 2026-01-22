@@ -54,13 +54,19 @@ def walk_forward_backtest(
         week_games = season_games[season_games["week"] == week]
         week_game_ids = week_games["game_id"].tolist()
         
-        # Get training data: all games before this week
-        train_games = season_games[season_games["week"] < week]
+        # Get the date of the first game in this week (for temporal filtering)
+        week_date = week_games["date"].min()
+        
+        # Get training data: all games before this week's date (from any season)
+        # This allows training on multiple seasons of historical data
+        train_games = games[games["date"] < week_date]
         train_game_ids = train_games["game_id"].tolist()
         
         if len(train_game_ids) == 0:
             logger.warning(f"No training data for week {week}, skipping")
             continue
+        
+        logger.info(f"Training on {len(train_game_ids)} games from seasons {sorted(train_games['season'].unique())}")
         
         # Get features for this week (to predict)
         week_features = features[
@@ -72,11 +78,8 @@ def walk_forward_backtest(
             logger.warning(f"No features for week {week}, skipping")
             continue
         
-        # Train models on training data
-        train_features = features[
-            (features["game_id"].isin(train_game_ids)) &
-            (features["season"] == season)
-        ]
+        # Train models on training data (from all previous seasons)
+        train_features = features[features["game_id"].isin(train_game_ids)]
         train_player_game = player_game[player_game["game_id"].isin(train_game_ids)]
         train_team_game = team_game[team_game["game_id"].isin(train_game_ids)]
         
@@ -92,10 +95,28 @@ def walk_forward_backtest(
             position_specific = model_type.endswith("_pos") or model_type == "gbm_pos" or model_type == "ridge_pos"
             model_type_clean = model_type.replace("_pos", "")
             
+            # Tune hyperparameters based on model type and training data size
+            ml_kwargs = {}
+            if model_type_clean == "ridge":
+                ml_kwargs = {"alpha": 0.5}
+            elif model_type_clean == "gbm":
+                # Balanced tuning for target prediction with more data
+                # Reduced from 200 to 150 to speed up training
+                ml_kwargs = {
+                    "n_estimators": 150,  # More trees but not too many
+                    "max_depth": 4,  # Moderate depth
+                    "learning_rate": 0.05,  # Standard learning rate
+                    "subsample": 0.8,
+                    "min_samples_split": 20,  # Standard splits
+                    "min_samples_leaf": 5
+                }
+            
             role_model = MLRoleModel(model_type=model_type_clean, position_specific=position_specific)
-            # Pass players for position-specific models
+            # Store kwargs for model initialization
+            role_model.kwargs = ml_kwargs
+            # Pass players, team_game, and games for team volume features
             try:
-                role_model.fit(train_features, train_player_game, players)
+                role_model.fit(train_features, train_player_game, players, train_team_game, games)
             except Exception as e:
                 logger.warning(f"Error fitting ML model: {e}, falling back to baseline")
                 role_model = BaselineRoleModel()
@@ -121,9 +142,13 @@ def walk_forward_backtest(
                         train_player_game, train_team_game, players, games
                     ).iloc[0]
                 else:
-                    # Pass players for position-specific models
-                    proj_targets = role_model.predict_targets(pd.DataFrame([row]), players).iloc[0]
-                    proj_carries = role_model.predict_carries(pd.DataFrame([row]), players).iloc[0]
+                    # Pass players, team_game, and games for team volume features
+                    proj_targets = role_model.predict_targets(
+                        pd.DataFrame([row]), players, train_team_game, games
+                    ).iloc[0]
+                    proj_carries = role_model.predict_carries(
+                        pd.DataFrame([row]), players, train_team_game, games
+                    ).iloc[0]
                 
                 # Predict efficiency
                 proj_epa_per_target = efficiency_model.predict_epa_per_target(
