@@ -1,0 +1,2 @@
+# This directory holds data files (Parquet and DuckDB)
+# Data files are ignored by .gitignore
