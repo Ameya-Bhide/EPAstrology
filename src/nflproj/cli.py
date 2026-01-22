@@ -446,8 +446,9 @@ def project(
 @app.command()
 def backtest(
     season: int = typer.Argument(..., help="Season to backtest"),
-    model: str = typer.Option("baseline", "--model", help="Model type: baseline or ml"),
+    model: str = typer.Option("baseline", "--model", help="Model type: baseline, ridge, poisson, gbm, ridge_pos, or gbm_pos"),
     compare: bool = typer.Option(False, "--compare", help="Compare baseline vs ML"),
+    ml_model: str = typer.Option("gbm_pos", "--ml-model", help="ML model to compare (gbm_pos, ridge_pos, gbm, ridge)"),
     data_dir: Optional[str] = typer.Option(
         None,
         "--data-dir",
@@ -473,8 +474,10 @@ def backtest(
     
     if compare:
         results = compare_baseline_vs_ml(
-            season, player_game, team_game, features, games, players
+            season, player_game, team_game, features, games, players, ml_model=ml_model
         )
+        
+        console.print(f"\n[bold]Comparing Baseline vs {results.get('ml_model', 'ML')}[/bold]")
         
         console.print("\n[bold]Baseline Metrics:[/bold]")
         for k, v in results["baseline"].items():

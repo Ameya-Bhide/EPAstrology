@@ -88,8 +88,18 @@ def walk_forward_backtest(
             efficiency_model = BaselineEfficiencyModel()
             efficiency_model.fit(train_player_game, players)
         else:
-            role_model = MLRoleModel(model_type=model_type)
-            role_model.fit(train_features, train_player_game)
+            # Use position-specific models if model_type includes it
+            position_specific = model_type.endswith("_pos") or model_type == "gbm_pos" or model_type == "ridge_pos"
+            model_type_clean = model_type.replace("_pos", "")
+            
+            role_model = MLRoleModel(model_type=model_type_clean, position_specific=position_specific)
+            # Pass players for position-specific models
+            try:
+                role_model.fit(train_features, train_player_game, players)
+            except Exception as e:
+                logger.warning(f"Error fitting ML model: {e}, falling back to baseline")
+                role_model = BaselineRoleModel()
+                role_model.fit(train_player_game, train_team_game, players)
             
             efficiency_model = BaselineEfficiencyModel()  # Still use baseline for efficiency
             efficiency_model.fit(train_player_game, players)
@@ -111,8 +121,9 @@ def walk_forward_backtest(
                         train_player_game, train_team_game, players, games
                     ).iloc[0]
                 else:
-                    proj_targets = role_model.predict_targets(pd.DataFrame([row])).iloc[0]
-                    proj_carries = role_model.predict_carries(pd.DataFrame([row])).iloc[0]
+                    # Pass players for position-specific models
+                    proj_targets = role_model.predict_targets(pd.DataFrame([row]), players).iloc[0]
+                    proj_carries = role_model.predict_carries(pd.DataFrame([row]), players).iloc[0]
                 
                 # Predict efficiency
                 proj_epa_per_target = efficiency_model.predict_epa_per_target(
@@ -228,27 +239,32 @@ def compare_baseline_vs_ml(
     team_game: pd.DataFrame,
     features: pd.DataFrame,
     games: pd.DataFrame,
-    players: pd.DataFrame
+    players: pd.DataFrame,
+    ml_model: str = "gbm_pos"
 ) -> Dict:
     """
     Compare baseline vs ML models in backtest.
     
+    Args:
+        ml_model: ML model type to compare (default: gbm_pos for position-specific)
+    
     Returns:
         Dictionary with metrics for both models
     """
-    logger.info(f"Comparing baseline vs ML for season {season}")
+    logger.info(f"Comparing baseline vs {ml_model} for season {season}")
     
     baseline_results = walk_forward_backtest(
         season, player_game, team_game, features, games, players, model_type="baseline"
     )
     
     ml_results = walk_forward_backtest(
-        season, player_game, team_game, features, games, players, model_type="ridge"
+        season, player_game, team_game, features, games, players, model_type=ml_model
     )
     
     return {
         "baseline": baseline_results.get("metrics", {}),
         "ml": ml_results.get("metrics", {}),
+        "ml_model": ml_model,
         "improvement": {
             k: ml_results.get("metrics", {}).get(k, 0) - baseline_results.get("metrics", {}).get(k, 0)
             for k in baseline_results.get("metrics", {}).keys()

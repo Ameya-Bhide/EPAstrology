@@ -403,29 +403,55 @@ class BaselineEfficiencyModel:
 class MLRoleModel:
     """ML model for role prediction."""
     
-    def __init__(self, model_type: str = "ridge"):
+    def __init__(self, model_type: str = "ridge", position_specific: bool = False):
         self.model_type = model_type
+        self.position_specific = position_specific
         self.targets_model = None
         self.carries_model = None
         self.scaler = StandardScaler()
         self.feature_cols = None
+        
+        # Position-specific models
+        if position_specific:
+            self.position_models = {
+                "WR": {"targets": None, "carries": None, "scaler": StandardScaler()},
+                "RB": {"targets": None, "carries": None, "scaler": StandardScaler()},
+                "TE": {"targets": None, "carries": None, "scaler": StandardScaler()},
+            }
     
     def _get_feature_cols(self, features: pd.DataFrame) -> list:
         """Get feature columns for modeling."""
         cols = [
+            # Rolling role stats
             "targets_last1", "targets_last3", "targets_last6",
             "carries_last1", "carries_last3", "carries_last6",
+            # Shares (important for role prediction)
             "target_share_last3", "target_share_last6",
             "carry_share_last3", "carry_share_last6",
+            # Trends
             "target_share_slope_3", "carry_share_slope_3",
+            # Context
             "team_pass_rate_last6", "team_plays_last6",
-            "opp_def_epa_allowed_last6"
+            # Opponent
+            "opp_def_epa_allowed_last6",
+            # Efficiency features (can help predict role - efficient players get more opportunities)
+            "epa_per_target_last6", "epa_per_rush_last6",
+            "success_rate_last6",
         ]
         # Only include columns that exist
         return [c for c in cols if c in features.columns]
     
-    def fit(self, features: pd.DataFrame, player_game: pd.DataFrame):
+    def fit(self, features: pd.DataFrame, player_game: pd.DataFrame, players: Optional[pd.DataFrame] = None):
         """Fit ML models for targets and carries."""
+        # Merge with players to get position if not already there
+        if players is not None and "position" not in features.columns:
+            features = pd.merge(
+                features,
+                players[["player_id", "position"]],
+                on="player_id",
+                how="left"
+            )
+        
         self.feature_cols = self._get_feature_cols(features)
         
         # Merge with actuals
@@ -436,6 +462,46 @@ class MLRoleModel:
             how="inner"
         )
         
+        if self.position_specific and "position" in merged.columns:
+            # Fit separate models for each position
+            for position in ["WR", "RB", "TE"]:
+                pos_data = merged[merged["position"] == position].copy()
+                if len(pos_data) < 10:  # Need minimum data
+                    logger.warning(f"Not enough data for {position} model ({len(pos_data)} samples), skipping")
+                    continue
+                
+                X_pos = pos_data[self.feature_cols].fillna(0)
+                y_targets_pos = pos_data["targets"]
+                y_carries_pos = pos_data["carries"]
+                
+                # Scale features
+                X_pos_scaled = self.position_models[position]["scaler"].fit_transform(X_pos)
+                
+                # Fit models
+                if self.model_type == "ridge":
+                    self.position_models[position]["targets"] = Ridge(alpha=0.5)
+                    self.position_models[position]["carries"] = Ridge(alpha=0.5)
+                elif self.model_type == "poisson":
+                    self.position_models[position]["targets"] = PoissonRegressor(alpha=0.5)
+                    self.position_models[position]["carries"] = PoissonRegressor(alpha=0.5)
+                elif self.model_type == "gbm":
+                    self.position_models[position]["targets"] = GradientBoostingRegressor(
+                        n_estimators=100, max_depth=3, learning_rate=0.05,
+                        subsample=0.8, min_samples_split=20
+                    )
+                    self.position_models[position]["carries"] = GradientBoostingRegressor(
+                        n_estimators=100, max_depth=3, learning_rate=0.05,
+                        subsample=0.8, min_samples_split=20
+                    )
+                else:
+                    raise ValueError(f"Unknown model type: {self.model_type}")
+                
+                self.position_models[position]["targets"].fit(X_pos_scaled, y_targets_pos)
+                self.position_models[position]["carries"].fit(X_pos_scaled, y_carries_pos)
+                
+                logger.info(f"Fitted {position} model with {len(pos_data)} samples")
+        
+        # Also fit global model (for positions not in position_specific or as fallback)
         X = merged[self.feature_cols].fillna(0)
         y_targets = merged["targets"]
         y_carries = merged["carries"]
@@ -443,40 +509,117 @@ class MLRoleModel:
         # Scale features
         X_scaled = self.scaler.fit_transform(X)
         
-        # Fit models
+        # Fit models with improved default hyperparameters
         if self.model_type == "ridge":
-            self.targets_model = Ridge(alpha=1.0)
-            self.carries_model = Ridge(alpha=1.0)
+            # Lower alpha for less regularization
+            self.targets_model = Ridge(alpha=0.5)
+            self.carries_model = Ridge(alpha=0.5)
         elif self.model_type == "poisson":
-            self.targets_model = PoissonRegressor(alpha=1.0)
-            self.carries_model = PoissonRegressor(alpha=1.0)
+            # Poisson is better for count data
+            self.targets_model = PoissonRegressor(alpha=0.5)
+            self.carries_model = PoissonRegressor(alpha=0.5)
         elif self.model_type == "gbm":
-            self.targets_model = GradientBoostingRegressor(n_estimators=100, max_depth=3)
-            self.carries_model = GradientBoostingRegressor(n_estimators=100, max_depth=3)
+            # Better defaults for GBM
+            self.targets_model = GradientBoostingRegressor(
+                n_estimators=100, 
+                max_depth=3, 
+                learning_rate=0.05,
+                subsample=0.8,
+                min_samples_split=20
+            )
+            self.carries_model = GradientBoostingRegressor(
+                n_estimators=100, 
+                max_depth=3, 
+                learning_rate=0.05,
+                subsample=0.8,
+                min_samples_split=20
+            )
         else:
             raise ValueError(f"Unknown model type: {self.model_type}")
         
         self.targets_model.fit(X_scaled, y_targets)
         self.carries_model.fit(X_scaled, y_carries)
     
-    def predict_targets(self, features: pd.DataFrame) -> pd.Series:
+    def predict_targets(self, features: pd.DataFrame, players: Optional[pd.DataFrame] = None) -> pd.Series:
         """Predict targets."""
         if self.targets_model is None:
             raise ValueError("Model not fitted")
         
+        # Get position if available
+        if self.position_specific and players is not None:
+            if "position" not in features.columns:
+                features = pd.merge(
+                    features,
+                    players[["player_id", "position"]],
+                    on="player_id",
+                    how="left"
+                )
+        
         X = features[self.feature_cols].fillna(0)
-        X_scaled = self.scaler.transform(X)
-        preds = self.targets_model.predict(X_scaled)
+        preds = []
+        
+        if self.position_specific and "position" in features.columns:
+            # Use position-specific models where available
+            for idx, row in features.iterrows():
+                position = row.get("position", None)
+                if position in self.position_models and self.position_models[position]["targets"] is not None:
+                    # Use position-specific model
+                    X_pos = X.iloc[[idx]]
+                    X_pos_scaled = self.position_models[position]["scaler"].transform(X_pos)
+                    pred = self.position_models[position]["targets"].predict(X_pos_scaled)[0]
+                    preds.append(pred)
+                else:
+                    # Fall back to global model
+                    X_scaled = self.scaler.transform(X.iloc[[idx]])
+                    pred = self.targets_model.predict(X_scaled)[0]
+                    preds.append(pred)
+            preds = np.array(preds)
+        else:
+            # Use global model
+            X_scaled = self.scaler.transform(X)
+            preds = self.targets_model.predict(X_scaled)
+        
         return pd.Series(np.maximum(0, preds), index=features.index)
     
-    def predict_carries(self, features: pd.DataFrame) -> pd.Series:
+    def predict_carries(self, features: pd.DataFrame, players: Optional[pd.DataFrame] = None) -> pd.Series:
         """Predict carries."""
         if self.carries_model is None:
             raise ValueError("Model not fitted")
         
+        # Get position if available
+        if self.position_specific and players is not None:
+            if "position" not in features.columns:
+                features = pd.merge(
+                    features,
+                    players[["player_id", "position"]],
+                    on="player_id",
+                    how="left"
+                )
+        
         X = features[self.feature_cols].fillna(0)
-        X_scaled = self.scaler.transform(X)
-        preds = self.carries_model.predict(X_scaled)
+        preds = []
+        
+        if self.position_specific and "position" in features.columns:
+            # Use position-specific models where available
+            for idx, row in features.iterrows():
+                position = row.get("position", None)
+                if position in self.position_models and self.position_models[position]["carries"] is not None:
+                    # Use position-specific model
+                    X_pos = X.iloc[[idx]]
+                    X_pos_scaled = self.position_models[position]["scaler"].transform(X_pos)
+                    pred = self.position_models[position]["carries"].predict(X_pos_scaled)[0]
+                    preds.append(pred)
+                else:
+                    # Fall back to global model
+                    X_scaled = self.scaler.transform(X.iloc[[idx]])
+                    pred = self.carries_model.predict(X_scaled)[0]
+                    preds.append(pred)
+            preds = np.array(preds)
+        else:
+            # Use global model
+            X_scaled = self.scaler.transform(X)
+            preds = self.carries_model.predict(X_scaled)
+        
         return pd.Series(np.maximum(0, preds), index=features.index)
 
 
