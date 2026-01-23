@@ -110,6 +110,33 @@ def walk_forward_backtest(
                     "min_samples_split": 20,  # Standard splits
                     "min_samples_leaf": 5
                 }
+            elif model_type_clean == "xgb":
+                # XGBoost hyperparameters optimized for larger dataset
+                ml_kwargs = {
+                    "n_estimators": 200,
+                    "max_depth": 5,
+                    "learning_rate": 0.03,
+                    "subsample": 0.8,
+                    "colsample_bytree": 0.8,
+                    "min_child_weight": 3,
+                    "reg_alpha": 0.1,
+                    "reg_lambda": 1.0,
+                    "random_state": 42
+                }
+            elif model_type_clean == "nn":
+                # Neural network hyperparameters
+                ml_kwargs = {
+                    "hidden_layer_sizes": (128, 64, 32),
+                    "activation": "relu",
+                    "solver": "adam",
+                    "alpha": 0.01,
+                    "learning_rate": "adaptive",
+                    "learning_rate_init": 0.001,
+                    "max_iter": 500,
+                    "early_stopping": True,
+                    "validation_fraction": 0.1,
+                    "random_state": 42
+                }
             
             role_model = MLRoleModel(model_type=model_type_clean, position_specific=position_specific)
             # Store kwargs for model initialization
@@ -130,35 +157,82 @@ def walk_forward_backtest(
             player_id = row["player_id"]
             game_id = row["game_id"]
             
+            # Get player position
+            player_info = players[players["player_id"] == player_id]
+            if len(player_info) == 0:
+                position = None
+            else:
+                position = player_info.iloc[0]["position"]
+            
+            # Skip QBs for target/carry predictions (they use pass attempts)
+            is_qb = position == "QB"
+            
             try:
                 # Predict role
+                proj_pass_attempts = 0.0  # Initialize for non-QBs
                 if isinstance(role_model, BaselineRoleModel):
-                    proj_targets = role_model.predict_targets(
-                        pd.DataFrame([row]),
-                        train_player_game, train_team_game, players, games
-                    ).iloc[0]
-                    proj_carries = role_model.predict_carries(
-                        pd.DataFrame([row]),
-                        train_player_game, train_team_game, players, games
-                    ).iloc[0]
+                    if is_qb:
+                        # QBs use pass attempts, not targets/carries
+                        proj_targets = 0.0
+                        proj_pass_attempts = role_model.predict_pass_attempts(
+                            pd.DataFrame([row]),
+                            train_player_game, train_team_game, players, games
+                        ).iloc[0]
+                        proj_carries = role_model.predict_carries(
+                            pd.DataFrame([row]),
+                            train_player_game, train_team_game, players, games
+                        ).iloc[0]
+                    else:
+                        proj_targets = role_model.predict_targets(
+                            pd.DataFrame([row]),
+                            train_player_game, train_team_game, players, games
+                        ).iloc[0]
+                        proj_carries = role_model.predict_carries(
+                            pd.DataFrame([row]),
+                            train_player_game, train_team_game, players, games
+                        ).iloc[0]
                 else:
-                    # Pass players, team_game, and games for team volume features
-                    proj_targets = role_model.predict_targets(
-                        pd.DataFrame([row]), players, train_team_game, games
-                    ).iloc[0]
-                    proj_carries = role_model.predict_carries(
-                        pd.DataFrame([row]), players, train_team_game, games
-                    ).iloc[0]
+                    # ML model - check if QB and use pass attempts model
+                    if is_qb and hasattr(role_model, 'pass_attempts_model') and role_model.pass_attempts_model is not None:
+                        # QB: predict pass attempts instead of targets
+                        proj_pass_attempts = role_model.predict_pass_attempts(
+                            pd.DataFrame([row]), players, train_team_game, games
+                        ).iloc[0]
+                        proj_targets = 0.0
+                        proj_carries = role_model.predict_carries(
+                            pd.DataFrame([row]), players, train_team_game, games
+                        ).iloc[0]
+                    else:
+                        # Skill position: predict targets and carries
+                        proj_targets = role_model.predict_targets(
+                            pd.DataFrame([row]), players, train_team_game, games
+                        ).iloc[0]
+                        proj_carries = role_model.predict_carries(
+                            pd.DataFrame([row]), players, train_team_game, games
+                        ).iloc[0]
                 
                 # Predict efficiency
-                proj_epa_per_target = efficiency_model.predict_epa_per_target(
-                    pd.DataFrame([row]),
-                    train_player_game, players
-                ).iloc[0]
-                proj_epa_per_rush = efficiency_model.predict_epa_per_rush(
-                    pd.DataFrame([row]),
-                    train_player_game, players
-                ).iloc[0]
+                if is_qb:
+                    # QB efficiency metrics
+                    proj_epa_per_attempt = efficiency_model.predict_epa_per_attempt(
+                        pd.DataFrame([row]),
+                        train_player_game, players, games
+                    ).iloc[0]
+                    proj_epa_per_target = 0.0
+                    proj_epa_per_rush = efficiency_model.predict_epa_per_rush(
+                        pd.DataFrame([row]),
+                        train_player_game, players
+                    ).iloc[0]
+                else:
+                    proj_epa_per_target = efficiency_model.predict_epa_per_target(
+                        pd.DataFrame([row]),
+                        train_player_game, players
+                    ).iloc[0]
+                    proj_epa_per_rush = efficiency_model.predict_epa_per_rush(
+                        pd.DataFrame([row]),
+                        train_player_game, players
+                    ).iloc[0]
+                    proj_epa_per_attempt = 0.0
                 
                 # Get actuals
                 actual = player_game[
@@ -168,13 +242,29 @@ def walk_forward_backtest(
                 
                 if len(actual) > 0:
                     actual = actual.iloc[0]
-                    actual_targets = actual["targets"]
-                    actual_carries = actual["carries"]
-                    actual_epa_per_target = actual["epa_per_target"] if actual["targets"] > 0 else 0.0
-                    actual_epa_per_rush = actual["epa_per_rush"] if actual["carries"] > 0 else 0.0
-                    actual_epa_total = actual["epa_total"]
-                    
-                    proj_epa_total = proj_targets * proj_epa_per_target + proj_carries * proj_epa_per_rush
+                    if is_qb:
+                        actual_targets = 0.0
+                        actual_carries = actual.get("carries", 0)
+                        actual_pass_attempts = actual.get("pass_attempts", 0)
+                        actual_epa_per_target = 0.0
+                        actual_epa_per_rush = actual["epa_per_rush"] if actual["carries"] > 0 else 0.0
+                        actual_epa_per_attempt = actual.get("epa_per_attempt", 0.0) if actual_pass_attempts > 0 else 0.0
+                        actual_epa_total = actual["epa_total"]
+                        
+                        if isinstance(role_model, BaselineRoleModel):
+                            proj_epa_total = proj_carries * proj_epa_per_rush + proj_pass_attempts * proj_epa_per_attempt
+                        else:
+                            proj_epa_total = proj_carries * proj_epa_per_rush + proj_pass_attempts * proj_epa_per_attempt
+                    else:
+                        actual_targets = actual["targets"]
+                        actual_carries = actual["carries"]
+                        actual_pass_attempts = 0.0
+                        actual_epa_per_target = actual["epa_per_target"] if actual["targets"] > 0 else 0.0
+                        actual_epa_per_rush = actual["epa_per_rush"] if actual["carries"] > 0 else 0.0
+                        actual_epa_per_attempt = 0.0
+                        actual_epa_total = actual["epa_total"]
+                        
+                        proj_epa_total = proj_targets * proj_epa_per_target + proj_carries * proj_epa_per_rush
                     
                     all_predictions.append({
                         "game_id": game_id,
@@ -182,8 +272,10 @@ def walk_forward_backtest(
                         "week": week,
                         "proj_targets": proj_targets,
                         "proj_carries": proj_carries,
+                        "proj_pass_attempts": proj_pass_attempts if is_qb else 0.0,
                         "proj_epa_per_target": proj_epa_per_target,
                         "proj_epa_per_rush": proj_epa_per_rush,
+                        "proj_epa_per_attempt": proj_epa_per_attempt,
                         "proj_epa_total": proj_epa_total
                     })
                     
@@ -193,8 +285,10 @@ def walk_forward_backtest(
                         "week": week,
                         "actual_targets": actual_targets,
                         "actual_carries": actual_carries,
+                        "actual_pass_attempts": actual_pass_attempts,
                         "actual_epa_per_target": actual_epa_per_target,
                         "actual_epa_per_rush": actual_epa_per_rush,
+                        "actual_epa_per_attempt": actual_epa_per_attempt,
                         "actual_epa_total": actual_epa_total
                     })
             except Exception as e:

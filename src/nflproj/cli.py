@@ -9,7 +9,7 @@ from rich.console import Console
 from rich.table import Table
 from rich import print as rprint
 
-from .config import PARQUET_DIR, DB_PATH, DEFAULT_SEASONS
+from .config import PARQUET_DIR, DB_PATH, DEFAULT_SEASONS, MODELS_DIR
 from .ingest import ingest_all
 from .build_tables import build_all_tables
 from .features import build_features_table
@@ -246,6 +246,217 @@ def features(
             output_path=output_path
         )
         console.print(f"[green]✓[/green] Built offense features: {len(features_df)} rows")
+
+
+@app.command()
+def train_models(
+    model_type: str = typer.Option("gbm_pos", "--model", help="Model type: ridge, gbm, xgb, nn (with _pos suffix for position-specific)"),
+    train_seasons: str = typer.Option("2010-2023", "--train-seasons", help="Seasons to train on (e.g., '2010-2023' or '2020,2021,2022')"),
+    output_dir: Optional[str] = typer.Option(None, "--output-dir", help="Directory to save models"),
+    data_dir: Optional[str] = typer.Option(None, "--data-dir", help="Data directory with Parquet files")
+):
+    """
+    Train and save ML models for reuse.
+    
+    Examples:
+        nflproj train-models --model gbm_pos --train-seasons 2010-2023
+        nflproj train-models --model xgb_pos --train-seasons 2020,2021,2022,2023
+    """
+    console.print(f"[bold green]Training {model_type} model...[/bold green]")
+    
+    data_path = Path(data_dir) if data_dir else PARQUET_DIR
+    models_path = Path(output_dir) if output_dir else MODELS_DIR
+    
+    # Load data
+    try:
+        player_game = pd.read_parquet(data_path / "player_game_offense.parquet")
+        team_game = pd.read_parquet(data_path / "team_game_offense.parquet")
+        games = pd.read_parquet(data_path / "games.parquet")
+        players = pd.read_parquet(data_path / "players.parquet")
+        features = pd.read_parquet(data_path / "features_player_game_offense.parquet")
+    except FileNotFoundError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        console.print("Run 'build' and 'features' commands first.")
+        raise typer.Exit(1)
+    
+    # Parse training seasons
+    if "-" in train_seasons:
+        # Range format: 2010-2023
+        start_year, end_year = map(int, train_seasons.split("-"))
+        train_season_list = list(range(start_year, end_year + 1))
+    else:
+        # Comma-separated: 2020,2021,2022
+        train_season_list = [int(s.strip()) for s in train_seasons.split(",")]
+    
+    console.print(f"[dim]Training on seasons: {train_season_list}[/dim]")
+    
+    # Filter data to training seasons
+    train_games = games[games["season"].isin(train_season_list)]
+    train_game_ids = train_games["game_id"].tolist()
+    
+    train_player_game = player_game[player_game["game_id"].isin(train_game_ids)]
+    train_team_game = team_game[team_game["game_id"].isin(train_game_ids)]
+    train_features = features[features["game_id"].isin(train_game_ids)]
+    
+    console.print(f"[dim]Training data: {len(train_features):,} feature rows, {len(train_player_game):,} player-games[/dim]")
+    
+    # Determine if position-specific
+    position_specific = model_type.endswith("_pos")
+    model_type_clean = model_type.replace("_pos", "")
+    
+    # Set hyperparameters
+    ml_kwargs = {}
+    if model_type_clean == "ridge":
+        ml_kwargs = {"alpha": 0.5}
+    elif model_type_clean == "gbm":
+        ml_kwargs = {
+            "n_estimators": 150,
+            "max_depth": 4,
+            "learning_rate": 0.05,
+            "subsample": 0.8,
+            "min_samples_split": 20,
+            "min_samples_leaf": 5
+        }
+    elif model_type_clean == "xgb":
+        ml_kwargs = {
+            "n_estimators": 200,
+            "max_depth": 5,
+            "learning_rate": 0.03,
+            "subsample": 0.8,
+            "colsample_bytree": 0.8,
+            "min_child_weight": 3,
+            "reg_alpha": 0.1,
+            "reg_lambda": 1.0,
+            "random_state": 42
+        }
+    elif model_type_clean == "nn":
+        ml_kwargs = {
+            "hidden_layer_sizes": (128, 64, 32),
+            "activation": "relu",
+            "solver": "adam",
+            "alpha": 0.01,
+            "learning_rate": "adaptive",
+            "learning_rate_init": 0.001,
+            "max_iter": 500,
+            "early_stopping": True,
+            "validation_fraction": 0.1,
+            "random_state": 42
+        }
+    
+    # Train model
+    from .models import MLRoleModel
+    
+    role_model = MLRoleModel(model_type=model_type_clean, position_specific=position_specific)
+    role_model.kwargs = ml_kwargs
+    
+    console.print("[dim]Fitting model...[/dim]")
+    try:
+        role_model.fit(train_features, train_player_game, players, train_team_game, games)
+        console.print("[green]✓[/green] Model trained successfully")
+    except Exception as e:
+        console.print(f"[red]Error training model:[/red] {e}")
+        import traceback
+        console.print(traceback.format_exc())
+        raise typer.Exit(1)
+    
+    # Save model
+    model_filename = f"role_model_{model_type}.joblib"
+    model_path = models_path / model_filename
+    
+    role_model.save(model_path)
+    console.print(f"[green]✓[/green] Model saved to {model_path}")
+    
+    # Show model info
+    console.print(f"\n[bold]Model Information:[/bold]")
+    console.print(f"  Type: {model_type}")
+    console.print(f"  Position-Specific: {position_specific}")
+    console.print(f"  Training Seasons: {train_season_list}")
+    console.print(f"  Training Samples: {len(train_features):,}")
+    console.print(f"\n[yellow]To use this model:[/yellow]")
+    console.print(f"  nflproj project <player> --model {model_type} --model-path {model_path}")
+
+
+@app.command()
+def list_models(
+    models_dir: Optional[str] = typer.Option(None, "--models-dir", help="Directory containing saved models"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show detailed model information")
+):
+    """
+    List all saved models.
+    
+    Examples:
+        nflproj list-models
+        nflproj list-models --verbose
+    """
+    models_path = Path(models_dir) if models_dir else MODELS_DIR
+    
+    if not models_path.exists():
+        console.print(f"[yellow]Models directory does not exist: {models_path}[/yellow]")
+        console.print("Train a model first with: nflproj train-models --model <model_type>")
+        raise typer.Exit(0)
+    
+    # Find all model files
+    model_files = list(models_path.glob("role_model_*.joblib"))
+    
+    if len(model_files) == 0:
+        console.print(f"[yellow]No saved models found in {models_path}[/yellow]")
+        console.print("\n[yellow]Train a model with:[/yellow]")
+        console.print("  nflproj train-models --model gbm_pos --train-seasons 2010-2023")
+        raise typer.Exit(0)
+    
+    console.print(f"[bold green]Found {len(model_files)} saved model(s):[/bold green]\n")
+    
+    # Create table
+    table = Table(title="Saved Models")
+    table.add_column("Model Type", style="cyan")
+    table.add_column("File", style="dim")
+    table.add_column("Size", style="green")
+    table.add_column("Modified", style="dim")
+    
+    if verbose:
+        table.add_column("Details", style="yellow")
+    
+    for model_file in sorted(model_files):
+        # Extract model type from filename (role_model_gbm_pos.joblib -> gbm_pos)
+        model_type = model_file.stem.replace("role_model_", "")
+        
+        # Get file size
+        size_bytes = model_file.stat().st_size
+        if size_bytes < 1024:
+            size_str = f"{size_bytes} B"
+        elif size_bytes < 1024 * 1024:
+            size_str = f"{size_bytes / 1024:.1f} KB"
+        else:
+            size_str = f"{size_bytes / (1024 * 1024):.1f} MB"
+        
+        # Get modification time
+        import datetime
+        mod_time = datetime.datetime.fromtimestamp(model_file.stat().st_mtime)
+        mod_str = mod_time.strftime("%Y-%m-%d %H:%M")
+        
+        if verbose:
+            # Try to load model and get details
+            try:
+                from .models import MLRoleModel
+                model = MLRoleModel.load(model_file)
+                details = f"Pos-specific: {model.position_specific}"
+                if hasattr(model, 'feature_cols') and model.feature_cols:
+                    details += f", Features: {len(model.feature_cols)}"
+            except Exception as e:
+                details = f"Error loading: {str(e)[:30]}"
+            
+            table.add_row(model_type, model_file.name, size_str, mod_str, details)
+        else:
+            table.add_row(model_type, model_file.name, size_str, mod_str)
+    
+    console.print(table)
+    
+    console.print(f"\n[yellow]Usage:[/yellow]")
+    console.print(f"  nflproj project <player> --model <model_type>")
+    console.print(f"\n[yellow]Example:[/yellow]")
+    if len(model_files) > 0:
+        first_model = model_files[0].stem.replace("role_model_", "")
+        console.print(f"  nflproj project \"Travis Kelce\" --week 2 --season 2023 --model {first_model}")
 
 
 @app.command()
@@ -714,7 +925,8 @@ def project(
     week: Optional[int] = typer.Option(None, "--week", help="Week number"),
     season: Optional[int] = typer.Option(None, "--season", help="Season year"),
     date: Optional[str] = typer.Option(None, "--date", help="Game date (YYYY-MM-DD)"),
-    model: str = typer.Option("baseline", "--model", help="Model type: baseline, ridge, poisson, gbm, ridge_pos, or gbm_pos"),
+    model: str = typer.Option("baseline", "--model", help="Model type: baseline, ridge, poisson, gbm, xgb, nn, ridge_pos, gbm_pos, xgb_pos, or nn_pos"),
+    model_path: Optional[str] = typer.Option(None, "--model-path", help="Path to saved model file (if not provided, will train or use default)"),
     data_dir: Optional[str] = typer.Option(
         None,
         "--data-dir",
@@ -813,27 +1025,61 @@ def project(
         role_model = BaselineRoleModel()
         role_model.fit(player_game, team_game, players)
     else:
-        # Use ML model
-        position_specific = model.endswith("_pos") or model == "gbm_pos" or model == "ridge_pos"
-        model_type_clean = model.replace("_pos", "")
+        # Check if saved model exists
+        default_model_path = MODELS_DIR / f"role_model_{model}.joblib"
+        model_path_to_use = Path(model_path) if model_path else default_model_path
         
-        # Get hyperparameters
-        ml_kwargs = {}
-        if model_type_clean == "ridge":
-            ml_kwargs = {"alpha": 0.5}
-        elif model_type_clean == "gbm":
-            ml_kwargs = {
-                "n_estimators": 150,
-                "max_depth": 4,
-                "learning_rate": 0.05,
-                "subsample": 0.8,
-                "min_samples_split": 20,
-                "min_samples_leaf": 5
-            }
-        
-        role_model = MLRoleModel(model_type=model_type_clean, position_specific=position_specific)
-        role_model.kwargs = ml_kwargs
-        role_model.fit(features, player_game, players, team_game, games)
+        if model_path_to_use.exists():
+            console.print(f"[dim]Loading saved model from {model_path_to_use}[/dim]")
+            role_model = MLRoleModel.load(model_path_to_use)
+        else:
+            # Use ML model - train on the fly
+            console.print(f"[dim]No saved model found, training {model} model...[/dim]")
+            position_specific = model.endswith("_pos") or model == "gbm_pos" or model == "ridge_pos"
+            model_type_clean = model.replace("_pos", "")
+            
+            # Get hyperparameters
+            ml_kwargs = {}
+            if model_type_clean == "ridge":
+                ml_kwargs = {"alpha": 0.5}
+            elif model_type_clean == "gbm":
+                ml_kwargs = {
+                    "n_estimators": 150,
+                    "max_depth": 4,
+                    "learning_rate": 0.05,
+                    "subsample": 0.8,
+                    "min_samples_split": 20,
+                    "min_samples_leaf": 5
+                }
+            elif model_type_clean == "xgb":
+                ml_kwargs = {
+                    "n_estimators": 200,
+                    "max_depth": 5,
+                    "learning_rate": 0.03,
+                    "subsample": 0.8,
+                    "colsample_bytree": 0.8,
+                    "min_child_weight": 3,
+                    "reg_alpha": 0.1,
+                    "reg_lambda": 1.0,
+                    "random_state": 42
+                }
+            elif model_type_clean == "nn":
+                ml_kwargs = {
+                    "hidden_layer_sizes": (128, 64, 32),
+                    "activation": "relu",
+                    "solver": "adam",
+                    "alpha": 0.01,
+                    "learning_rate": "adaptive",
+                    "learning_rate_init": 0.001,
+                    "max_iter": 500,
+                    "early_stopping": True,
+                    "validation_fraction": 0.1,
+                    "random_state": 42
+                }
+            
+            role_model = MLRoleModel(model_type=model_type_clean, position_specific=position_specific)
+            role_model.kwargs = ml_kwargs
+            role_model.fit(features, player_game, players, team_game, games)
     
     efficiency_model = BaselineEfficiencyModel()
     efficiency_model.fit(player_game, players)
@@ -1262,25 +1508,59 @@ def batch_project(
         role_model = BaselineRoleModel()
         role_model.fit(player_game, team_game, players_df)
     else:
-        position_specific = model.endswith("_pos") or model == "gbm_pos" or model == "ridge_pos"
-        model_type_clean = model.replace("_pos", "")
+        # Check if saved model exists
+        default_model_path = MODELS_DIR / f"role_model_{model}.joblib"
         
-        ml_kwargs = {}
-        if model_type_clean == "ridge":
-            ml_kwargs = {"alpha": 0.5}
-        elif model_type_clean == "gbm":
-            ml_kwargs = {
-                "n_estimators": 150,
-                "max_depth": 4,
-                "learning_rate": 0.05,
-                "subsample": 0.8,
-                "min_samples_split": 20,
-                "min_samples_leaf": 5
-            }
-        
-        role_model = MLRoleModel(model_type=model_type_clean, position_specific=position_specific)
-        role_model.kwargs = ml_kwargs
-        role_model.fit(features, player_game, players_df, team_game, games)
+        if default_model_path.exists():
+            console.print(f"[dim]Loading saved model from {default_model_path}[/dim]")
+            role_model = MLRoleModel.load(default_model_path)
+        else:
+            # Use ML model - train on the fly
+            console.print(f"[dim]No saved model found, training {model} model...[/dim]")
+            position_specific = model.endswith("_pos") or model == "gbm_pos" or model == "ridge_pos"
+            model_type_clean = model.replace("_pos", "")
+            
+            ml_kwargs = {}
+            if model_type_clean == "ridge":
+                ml_kwargs = {"alpha": 0.5}
+            elif model_type_clean == "gbm":
+                ml_kwargs = {
+                    "n_estimators": 150,
+                    "max_depth": 4,
+                    "learning_rate": 0.05,
+                    "subsample": 0.8,
+                    "min_samples_split": 20,
+                    "min_samples_leaf": 5
+                }
+            elif model_type_clean == "xgb":
+                ml_kwargs = {
+                    "n_estimators": 200,
+                    "max_depth": 5,
+                    "learning_rate": 0.03,
+                    "subsample": 0.8,
+                    "colsample_bytree": 0.8,
+                    "min_child_weight": 3,
+                    "reg_alpha": 0.1,
+                    "reg_lambda": 1.0,
+                    "random_state": 42
+                }
+            elif model_type_clean == "nn":
+                ml_kwargs = {
+                    "hidden_layer_sizes": (128, 64, 32),
+                    "activation": "relu",
+                    "solver": "adam",
+                    "alpha": 0.01,
+                    "learning_rate": "adaptive",
+                    "learning_rate_init": 0.001,
+                    "max_iter": 500,
+                    "early_stopping": True,
+                    "validation_fraction": 0.1,
+                    "random_state": 42
+                }
+            
+            role_model = MLRoleModel(model_type=model_type_clean, position_specific=position_specific)
+            role_model.kwargs = ml_kwargs
+            role_model.fit(features, player_game, players_df, team_game, games)
     
     efficiency_model = BaselineEfficiencyModel()
     efficiency_model.fit(player_game, players_df)
@@ -2153,9 +2433,9 @@ def defense_report(
 @app.command()
 def backtest(
     season: int = typer.Argument(..., help="Season to backtest"),
-    model: str = typer.Option("baseline", "--model", help="Model type: baseline, ridge, poisson, gbm, ridge_pos, or gbm_pos"),
+    model: str = typer.Option("baseline", "--model", help="Model type: baseline, ridge, poisson, gbm, xgb, nn, ridge_pos, gbm_pos, xgb_pos, or nn_pos"),
     compare: bool = typer.Option(False, "--compare", help="Compare baseline vs ML"),
-    ml_model: str = typer.Option("gbm_pos", "--ml-model", help="ML model to compare (gbm_pos, ridge_pos, gbm, ridge)"),
+    ml_model: str = typer.Option("gbm_pos", "--ml-model", help="ML model to compare (gbm_pos, ridge_pos, xgb_pos, nn_pos, gbm, ridge, xgb, nn)"),
     data_dir: Optional[str] = typer.Option(
         None,
         "--data-dir",

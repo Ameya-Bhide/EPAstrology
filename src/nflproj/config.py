@@ -9,11 +9,13 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 PARQUET_DIR = DATA_DIR / "parquet"
 DB_DIR = DATA_DIR / "db"
+MODELS_DIR = DATA_DIR / "models"
 
 # Create directories if they don't exist
 DATA_DIR.mkdir(exist_ok=True)
 PARQUET_DIR.mkdir(exist_ok=True)
 DB_DIR.mkdir(exist_ok=True)
+MODELS_DIR.mkdir(exist_ok=True)
 
 # Default seasons to ingest
 DEFAULT_SEASONS = list(range(2018, 2024))  # 2018-2023

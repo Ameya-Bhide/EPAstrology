@@ -5,8 +5,20 @@ import numpy as np
 from typing import Optional, Dict, Tuple
 from sklearn.linear_model import Ridge, PoissonRegressor
 from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
 import logging
+import joblib
+from pathlib import Path
+
+# Try to import XGBoost, but don't fail if not available
+try:
+    import xgboost as xgb
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    XGBOOST_AVAILABLE = False
+    logger = logging.getLogger(__name__)
+    logger.warning("XGBoost not available. Install with: pip install xgboost")
 
 from .config import SHRINKAGE_K
 
@@ -799,6 +811,43 @@ class MLRoleModel:
                     
                     self.position_models[position]["targets"] = GradientBoostingRegressor(**default_gbm)
                     self.position_models[position]["carries"] = GradientBoostingRegressor(**default_gbm)
+                elif self.model_type == "xgb" and XGBOOST_AVAILABLE:
+                    # XGBoost with tuned hyperparameters
+                    xgb_kwargs = self.kwargs.copy() if self.kwargs else {}
+                    default_xgb = {
+                        "n_estimators": 150,
+                        "max_depth": 4,
+                        "learning_rate": 0.05,
+                        "subsample": 0.8,
+                        "colsample_bytree": 0.8,
+                        "min_child_weight": 3,
+                        "reg_alpha": 0.1,
+                        "reg_lambda": 1.0,
+                        "random_state": 42
+                    }
+                    default_xgb.update(xgb_kwargs)
+                    
+                    self.position_models[position]["targets"] = xgb.XGBRegressor(**default_xgb)
+                    self.position_models[position]["carries"] = xgb.XGBRegressor(**default_xgb)
+                elif self.model_type == "nn":
+                    # Neural network with tuned hyperparameters
+                    nn_kwargs = self.kwargs.copy() if self.kwargs else {}
+                    default_nn = {
+                        "hidden_layer_sizes": (100, 50),
+                        "activation": "relu",
+                        "solver": "adam",
+                        "alpha": 0.01,
+                        "learning_rate": "adaptive",
+                        "learning_rate_init": 0.001,
+                        "max_iter": 500,
+                        "early_stopping": True,
+                        "validation_fraction": 0.1,
+                        "random_state": 42
+                    }
+                    default_nn.update(nn_kwargs)
+                    
+                    self.position_models[position]["targets"] = MLPRegressor(**default_nn)
+                    self.position_models[position]["carries"] = MLPRegressor(**default_nn)
                 else:
                     raise ValueError(f"Unknown model type: {self.model_type}")
                 
@@ -838,6 +887,43 @@ class MLRoleModel:
             
             self.targets_model = GradientBoostingRegressor(**default_gbm)
             self.carries_model = GradientBoostingRegressor(**default_gbm)
+        elif self.model_type == "xgb" and XGBOOST_AVAILABLE:
+            # XGBoost with tuned hyperparameters
+            xgb_kwargs = self.kwargs.copy() if self.kwargs else {}
+            default_xgb = {
+                "n_estimators": 150,
+                "max_depth": 4,
+                "learning_rate": 0.05,
+                "subsample": 0.8,
+                "colsample_bytree": 0.8,
+                "min_child_weight": 3,
+                "reg_alpha": 0.1,
+                "reg_lambda": 1.0,
+                "random_state": 42
+            }
+            default_xgb.update(xgb_kwargs)
+            
+            self.targets_model = xgb.XGBRegressor(**default_xgb)
+            self.carries_model = xgb.XGBRegressor(**default_xgb)
+        elif self.model_type == "nn":
+            # Neural network with tuned hyperparameters
+            nn_kwargs = self.kwargs.copy() if self.kwargs else {}
+            default_nn = {
+                "hidden_layer_sizes": (100, 50),
+                "activation": "relu",
+                "solver": "adam",
+                "alpha": 0.01,
+                "learning_rate": "adaptive",
+                "learning_rate_init": 0.001,
+                "max_iter": 500,
+                "early_stopping": True,
+                "validation_fraction": 0.1,
+                "random_state": 42
+            }
+            default_nn.update(nn_kwargs)
+            
+            self.targets_model = MLPRegressor(**default_nn)
+            self.carries_model = MLPRegressor(**default_nn)
         else:
             raise ValueError(f"Unknown model type: {self.model_type}")
         
@@ -905,6 +991,39 @@ class MLRoleModel:
                             }
                             default_gbm.update(gbm_kwargs)
                             self.pass_attempts_model = GradientBoostingRegressor(**default_gbm)
+                        elif self.model_type == "xgb" and XGBOOST_AVAILABLE:
+                            xgb_kwargs = self.kwargs.copy() if self.kwargs else {}
+                            default_xgb = {
+                                "n_estimators": 150,
+                                "max_depth": 4,
+                                "learning_rate": 0.05,
+                                "subsample": 0.8,
+                                "colsample_bytree": 0.8,
+                                "min_child_weight": 3,
+                                "reg_alpha": 0.1,
+                                "reg_lambda": 1.0,
+                                "random_state": 42
+                            }
+                            default_xgb.update(xgb_kwargs)
+                            self.pass_attempts_model = xgb.XGBRegressor(**default_xgb)
+                        elif self.model_type == "nn":
+                            nn_kwargs = self.kwargs.copy() if self.kwargs else {}
+                            default_nn = {
+                                "hidden_layer_sizes": (100, 50),
+                                "activation": "relu",
+                                "solver": "adam",
+                                "alpha": 0.01,
+                                "learning_rate": "adaptive",
+                                "learning_rate_init": 0.001,
+                                "max_iter": 500,
+                                "early_stopping": True,
+                                "validation_fraction": 0.1,
+                                "random_state": 42
+                            }
+                            default_nn.update(nn_kwargs)
+                            self.pass_attempts_model = MLPRegressor(**default_nn)
+                        else:
+                            raise ValueError(f"Unknown model type: {self.model_type}")
                         
                         self.pass_attempts_model.fit(X_qb_scaled, y_pass_attempts)
                         self.qb_feature_cols = qb_feature_cols
@@ -1128,6 +1247,58 @@ class MLRoleModel:
         all_preds.loc[qb_features.index] = np.maximum(0, qb_preds)
         
         return all_preds
+    
+    def save(self, model_path: Path):
+        """Save the model to disk."""
+        model_path = Path(model_path)
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Save model attributes
+        model_data = {
+            "model_type": self.model_type,
+            "position_specific": self.position_specific,
+            "targets_model": self.targets_model,
+            "carries_model": self.carries_model,
+            "pass_attempts_model": getattr(self, 'pass_attempts_model', None),
+            "scaler": self.scaler,
+            "feature_cols": self.feature_cols,
+            "kwargs": self.kwargs,
+            "position_models": getattr(self, 'position_models', {}),
+            "qb_feature_cols": getattr(self, 'qb_feature_cols', None),
+            "qb_scaler": getattr(self, 'qb_scaler', None),
+        }
+        
+        joblib.dump(model_data, model_path)
+        logger.info(f"Saved model to {model_path}")
+    
+    @classmethod
+    def load(cls, model_path: Path):
+        """Load a model from disk."""
+        model_path = Path(model_path)
+        if not model_path.exists():
+            raise FileNotFoundError(f"Model file not found: {model_path}")
+        
+        model_data = joblib.load(model_path)
+        
+        # Create model instance
+        model = cls(
+            model_type=model_data["model_type"],
+            position_specific=model_data["position_specific"]
+        )
+        
+        # Restore attributes
+        model.targets_model = model_data["targets_model"]
+        model.carries_model = model_data["carries_model"]
+        model.pass_attempts_model = model_data.get("pass_attempts_model")
+        model.scaler = model_data["scaler"]
+        model.feature_cols = model_data["feature_cols"]
+        model.kwargs = model_data.get("kwargs", {})
+        model.position_models = model_data.get("position_models", {})
+        model.qb_feature_cols = model_data.get("qb_feature_cols")
+        model.qb_scaler = model_data.get("qb_scaler")
+        
+        logger.info(f"Loaded model from {model_path}")
+        return model
 
 
 class BaselineDefenseModel:
